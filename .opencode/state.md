@@ -9,9 +9,10 @@ Build a systems programming language called Pack (`.pack` extension) using Ghulo
 - **Step 3**: C Codegen — emits compilable C from expression AST, works with `gcc`/`clang`, `--emit-c` flag
 - **Step 4**: Variables — `let x = 5;` with `let` keyword, variable references in expressions, program/statement AST, multiple variable support
 - **Step 5**: Conditionals — `if`/`else` expressions with comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`), blocks via `NODE_BLOCK`, GCC statement expression codegen
+- **Step 6**: `while` loops — `while cond { body }` expressions, `NODE_WHILE`, `codegen_block_all_stmts` helper for side-effect emission, optional semicolons after while blocks
 
 ## Next Steps (per PLAN.md)
-- **Step 6**: `while` loops
+- **Step 7**: Blocks and lexical scoping (scoped variables, shadowing)
 - **Step 7**: Blocks and lexical scoping (scoped variables, shadowing)
 - **Step 8**: Functions with parameters and return values
 - **Step 9**: Type checking / type annotations
@@ -39,3 +40,4 @@ Build a systems programming language called Pack (`.pack` extension) using Ghulo
 - `PLAN.md`: Full 26-step incremental compiler construction plan
 - `examples/hello.pack`: Test file (conditionals example)
 - `examples/conditional.pack`: Test file (if/else with let)
+- `examples/while.pack`: Test file (while loop)
