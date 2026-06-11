@@ -1,0 +1,5 @@
+fn add(a: int, b: int) -> int {
+  a + b
+};
+let x: int = add(3, 4);
+x + 1
