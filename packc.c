@@ -236,6 +236,146 @@ static void token_print(Token t) {
   printf("\n");
 }
 
+typedef enum {
+  NODE_NUMBER,
+  NODE_UNARY,
+  NODE_BINARY,
+} NodeType;
+
+typedef struct Node {
+  NodeType type;
+  struct Node *next;
+  union {
+    int number;
+    struct { TokenType op; struct Node *right; } unary;
+    struct { TokenType op; struct Node *left; struct Node *right; } binary;
+  } as;
+} Node;
+
+static Node *node_new(NodeType type) {
+  Node *n = calloc(1, sizeof(Node));
+  if (!n) { fprintf(stderr, "Out of memory\n"); exit(1); }
+  n->type = type;
+  return n;
+}
+
+static void node_print(FILE *out, Node *n) {
+  if (!n) { fprintf(out, "()"); return; }
+  switch (n->type) {
+    case NODE_NUMBER:
+      fprintf(out, "%d", n->as.number);
+      break;
+    case NODE_UNARY:
+      fprintf(out, "(%s ", token_name(n->as.unary.op));
+      node_print(out, n->as.unary.right);
+      fprintf(out, ")");
+      break;
+    case NODE_BINARY:
+      fprintf(out, "(%s ", token_name(n->as.binary.op));
+      node_print(out, n->as.binary.left);
+      fprintf(out, " ");
+      node_print(out, n->as.binary.right);
+      fprintf(out, ")");
+      break;
+  }
+}
+
+typedef struct {
+  Lexer *lexer;
+  Token current;
+  Token previous;
+  int panic;
+} Parser;
+
+static void parser_init(Parser *p, Lexer *l) {
+  p->lexer = l;
+  p->panic = 0;
+  p->current = lexer_next(l);
+}
+
+static void parser_advance(Parser *p) {
+  p->previous = p->current;
+  p->current = lexer_next(p->lexer);
+}
+
+static int parser_check(Parser *p, TokenType type) {
+  return p->current.type == type;
+}
+
+static int parser_match(Parser *p, TokenType type) {
+  if (!parser_check(p, type)) return 0;
+  parser_advance(p);
+  return 1;
+}
+
+static void parser_error(Parser *p, const char *msg) {
+  fprintf(stderr, "error:%d:%d: %s\n", p->previous.line, p->previous.column, msg);
+  p->panic = 1;
+}
+
+static Node *parse_expr(Parser *p);
+static Node *parse_term(Parser *p);
+static Node *parse_factor(Parser *p);
+
+static Node *parse_expr(Parser *p) {
+  Node *left = parse_term(p);
+  while (parser_match(p, TOKEN_PLUS) || parser_match(p, TOKEN_MINUS)) {
+    TokenType op = p->previous.type;
+    Node *right = parse_term(p);
+    Node *n = node_new(NODE_BINARY);
+    n->as.binary.op = op;
+    n->as.binary.left = left;
+    n->as.binary.right = right;
+    left = n;
+  }
+  return left;
+}
+
+static Node *parse_term(Parser *p) {
+  Node *left = parse_factor(p);
+  while (parser_match(p, TOKEN_STAR) || parser_match(p, TOKEN_SLASH)) {
+    TokenType op = p->previous.type;
+    Node *right = parse_factor(p);
+    Node *n = node_new(NODE_BINARY);
+    n->as.binary.op = op;
+    n->as.binary.left = left;
+    n->as.binary.right = right;
+    left = n;
+  }
+  return left;
+}
+
+static Node *parse_factor(Parser *p) {
+  if (parser_match(p, TOKEN_MINUS)) {
+    Node *n = node_new(NODE_UNARY);
+    n->as.unary.op = TOKEN_MINUS;
+    n->as.unary.right = parse_factor(p);
+    return n;
+  }
+  if (parser_match(p, TOKEN_LPAREN)) {
+    Node *expr = parse_expr(p);
+    if (!parser_match(p, TOKEN_RPAREN))
+      parser_error(p, "Expected ')'");
+    return expr;
+  }
+  if (parser_match(p, TOKEN_NUMBER)) {
+    Node *n = node_new(NODE_NUMBER);
+    n->as.number = atoi(p->previous.start);
+    return n;
+  }
+  parser_error(p, "Expected expression");
+  return NULL;
+}
+
+static Node *parse(Parser *p) {
+  Node *n = parse_expr(p);
+  if (!parser_check(p, TOKEN_EOF)) {
+    parser_error(p, "Unexpected token");
+    while (!parser_check(p, TOKEN_EOF)) parser_advance(p);
+  }
+  return n;
+}
+
 static char *read_file(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "Could not open %s\n", path); exit(1); }
@@ -254,20 +394,36 @@ static char *read_file(const char *path) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: packc <file.pack>\n");
+    fprintf(stderr, "Usage: packc [--tokens] <file.pack>\n");
     return 1;
   }
-  char *src = read_file(argv[1]);
+  int tokens_only = 0;
+  const char *path = argv[1];
+  if (argc >= 3 && strcmp(argv[1], "--tokens") == 0) {
+    tokens_only = 1;
+    path = argv[2];
+  }
+  char *src = read_file(path);
   Lexer lexer;
   lexer_init(&lexer, src);
-  Token t;
-  int errors = 0;
-  for (;;) {
-    t = lexer_next(&lexer);
-    token_print(t);
-    if (t.type == TOKEN_EOF) break;
-    if (t.type == TOKEN_ERROR) errors++;
+  if (tokens_only) {
+    Token t;
+    int errors = 0;
+    for (;;) {
+      t = lexer_next(&lexer);
+      token_print(t);
+      if (t.type == TOKEN_EOF) break;
+      if (t.type == TOKEN_ERROR) errors++;
+    }
+    free(src);
+    return errors > 0 ? 1 : 0;
   }
+  Parser parser;
+  parser_init(&parser, &lexer);
+  Node *ast = parse(&parser);
+  if (parser.panic) { free(src); return 1; }
+  node_print(stdout, ast);
+  printf("\n");
   free(src);
-  return errors > 0 ? 1 : 0;
+  return 0;
 }
