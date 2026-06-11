@@ -10,10 +10,9 @@ Build a systems programming language called Pack (`.pack` extension) using Ghulo
 - **Step 4**: Variables — `let x = 5;` with `let` keyword, variable references in expressions, program/statement AST, multiple variable support
 - **Step 5**: Conditionals — `if`/`else` expressions with comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`), blocks via `NODE_BLOCK`, GCC statement expression codegen
 - **Step 6**: `while` loops — `while cond { body }` expressions, `NODE_WHILE`, `codegen_block_all_stmts` helper for side-effect emission, optional semicolons after while blocks
+- **Step 7**: Blocks and lexical scoping — standalone `{ let x = 5; x + 1 }` block expressions, `SymTable` with push/pop scopes, duplicate `let` detection, undeclared variable detection, variable shadowing, scoped C codegen using `({...})`
 
 ## Next Steps (per PLAN.md)
-- **Step 7**: Blocks and lexical scoping (scoped variables, shadowing)
-- **Step 7**: Blocks and lexical scoping (scoped variables, shadowing)
 - **Step 8**: Functions with parameters and return values
 - **Step 9**: Type checking / type annotations
 - **Step 10**: Arrays and indexing
@@ -41,3 +40,4 @@ Build a systems programming language called Pack (`.pack` extension) using Ghulo
 - `examples/hello.pack`: Test file (conditionals example)
 - `examples/conditional.pack`: Test file (if/else with let)
 - `examples/while.pack`: Test file (while loop)
+- `examples/scope.pack`: Test file (block scope / shadowing)
