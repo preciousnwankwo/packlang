@@ -35,6 +35,7 @@ typedef enum {
   TOKEN_LET,
   TOKEN_IF,
   TOKEN_ELSE,
+  TOKEN_WHILE,
   TOKEN_ERROR,
 } TokenType;
 
@@ -86,6 +87,7 @@ static const char *token_name(TokenType t) {
     case TOKEN_LET:            return "LET";
     case TOKEN_IF:             return "IF";
     case TOKEN_ELSE:           return "ELSE";
+    case TOKEN_WHILE:          return "WHILE";
     case TOKEN_ERROR:          return "ERROR";
   }
   return "?";
@@ -172,6 +174,7 @@ static TokenType lexer_keyword(const char *start, int len) {
   if (len == 3 && memcmp(start, "let", 3) == 0) return TOKEN_LET;
   if (len == 2 && memcmp(start, "if", 2) == 0) return TOKEN_IF;
   if (len == 4 && memcmp(start, "else", 4) == 0) return TOKEN_ELSE;
+  if (len == 5 && memcmp(start, "while", 5) == 0) return TOKEN_WHILE;
   return TOKEN_IDENTIFIER;
 }
 
@@ -258,6 +261,7 @@ typedef enum {
   NODE_UNARY,
   NODE_BINARY,
   NODE_IF,
+  NODE_WHILE,
   NODE_BLOCK,
 } NodeType;
 
@@ -271,6 +275,7 @@ typedef struct Node {
     struct { struct Node *stmts; } program;
     struct { struct Node *stmts; } block;
     struct { struct Node *cond; struct Node *then_block; struct Node *else_block; } iff;
+    struct { struct Node *cond; struct Node *body; } whilee;
     struct { TokenType op; struct Node *right; } unary;
     struct { TokenType op; struct Node *left; struct Node *right; } binary;
   } as;
@@ -303,6 +308,7 @@ static const char *op_to_c(TokenType t) {
 
 static void codegen_expr(FILE *out, Node *n);
 static void codegen_block_stmts(FILE *out, Node *n);
+static void codegen_block_all_stmts(FILE *out, Node *n);
 static void codegen_block_expr(FILE *out, Node *n, int zero_if_empty);
 
 static void codegen_expr(FILE *out, Node *n) {
@@ -339,6 +345,13 @@ static void codegen_expr(FILE *out, Node *n) {
       fprintf(out, "; } _t%d; })", id);
       break;
     }
+    case NODE_WHILE:
+      fprintf(out, "({while (");
+      codegen_expr(out, n->as.whilee.cond);
+      fprintf(out, ") {");
+      codegen_block_all_stmts(out, n->as.whilee.body);
+      fprintf(out, " } 0; })");
+      break;
     default:
       break;
   }
@@ -349,6 +362,20 @@ static void codegen_block_stmts(FILE *out, Node *n) {
     if (s->type == NODE_LET) {
       fprintf(out, " int %s = ", s->as.let.name);
       codegen_expr(out, s->as.let.value);
+      fprintf(out, ";");
+    }
+  }
+}
+
+static void codegen_block_all_stmts(FILE *out, Node *n) {
+  for (Node *s = n->as.block.stmts; s; s = s->next) {
+    if (s->type == NODE_LET) {
+      fprintf(out, " int %s = ", s->as.let.name);
+      codegen_expr(out, s->as.let.value);
+      fprintf(out, ";");
+    } else {
+      fprintf(out, " ");
+      codegen_expr(out, s);
       fprintf(out, ";");
     }
   }
@@ -371,6 +398,17 @@ static void codegen_stmt(FILE *out, Node *n) {
       codegen_expr(out, n->as.let.value);
       fprintf(out, ";\n");
       break;
+    case NODE_IF:
+      codegen_expr(out, n);
+      fprintf(out, ";\n");
+      break;
+    case NODE_WHILE:
+      fprintf(out, "    while (");
+      codegen_expr(out, n->as.whilee.cond);
+      fprintf(out, ") {");
+      codegen_block_all_stmts(out, n->as.whilee.body);
+      fprintf(out, " }\n");
+      break;
     default:
       break;
   }
@@ -382,7 +420,7 @@ static void codegen(FILE *out, Node *n) {
     Node *last = NULL;
     for (Node *s = n->as.program.stmts; s; s = s->next) {
       last = s;
-      if (s->type == NODE_LET || s->type == NODE_IF)
+      if (s->type == NODE_LET || s->type == NODE_IF || s->type == NODE_WHILE)
         codegen_stmt(out, s);
     }
     fprintf(out, "    return ");
@@ -415,6 +453,13 @@ static void node_print(FILE *out, Node *n) {
         fprintf(out, " ");
         node_print(out, s);
       }
+      fprintf(out, ")");
+      break;
+    case NODE_WHILE:
+      fprintf(out, "(WHILE ");
+      node_print(out, n->as.whilee.cond);
+      fprintf(out, " ");
+      node_print(out, n->as.whilee.body);
       fprintf(out, ")");
       break;
     case NODE_IF:
@@ -495,6 +540,7 @@ static char *strdup_token(const Token *t) {
 }
 
 static Node *parse_expr(Parser *p);
+static Node *parse_comparison(Parser *p);
 static Node *parse_term(Parser *p);
 static Node *parse_factor(Parser *p);
 static Node *parse_statement(Parser *p);
@@ -534,17 +580,23 @@ static Node *parse_statement(Parser *p) {
     return n;
   }
   Node *expr = parse_expr(p);
-  if (expr && expr->type != NODE_IF)
+  if (expr && expr->type != NODE_IF && expr->type != NODE_WHILE)
     parser_match(p, TOKEN_SEMICOLON);
   return expr;
 }
 
-static Node *parse_comparison(Parser *p);
-static Node *parse_term(Parser *p);
-static Node *parse_factor(Parser *p);
-
 static Node *parse_expr(Parser *p) {
-  return parse_comparison(p);
+  Node *left = parse_comparison(p);
+  while (parser_match(p, TOKEN_PLUS) || parser_match(p, TOKEN_MINUS)) {
+    TokenType op = p->previous.type;
+    Node *right = parse_comparison(p);
+    Node *n = node_new(NODE_BINARY);
+    n->as.binary.op = op;
+    n->as.binary.left = left;
+    n->as.binary.right = right;
+    left = n;
+  }
+  return left;
 }
 
 static Node *parse_comparison(Parser *p) {
@@ -578,6 +630,14 @@ static Node *parse_term(Parser *p) {
 }
 
 static Node *parse_factor(Parser *p) {
+  if (parser_match(p, TOKEN_WHILE)) {
+    Node *cond = parse_expr(p);
+    Node *body = parse_block(p);
+    Node *n = node_new(NODE_WHILE);
+    n->as.whilee.cond = cond;
+    n->as.whilee.body = body;
+    return n;
+  }
   if (parser_match(p, TOKEN_IF)) {
     Node *cond = parse_expr(p);
     Node *then_block = parse_block(p);
@@ -626,6 +686,7 @@ static Node *parse_block(Parser *p) {
   while (!parser_check(p, TOKEN_RBRACE) && !parser_check(p, TOKEN_EOF)) {
     Node *stmt = parse_statement(p);
     if (p->panic) { n->as.block.stmts = head; return n; }
+    if (!stmt) break;
     if (!head) head = stmt;
     else tail->next = stmt;
     tail = stmt;
