@@ -6,6 +6,8 @@
 #define MAX_SCOPE 64
 #define MAX_VARS_PER_SCOPE 64
 
+static char *strdup_str(const char *s);
+
 typedef struct {
   char *names[MAX_VARS_PER_SCOPE];
   int count;
@@ -31,7 +33,7 @@ static int sym_define(SymTable *st, const char *name) {
   Scope *s = &st->scopes[st->depth];
   for (int i = 0; i < s->count; i++)
     if (strcmp(s->names[i], name) == 0) return 0;
-  s->names[s->count++] = strdup(name);
+  s->names[s->count++] = strdup_str(name);
   return 1;
 }
 
@@ -595,6 +597,13 @@ static int parser_match(Parser *p, TokenType type) {
 static void parser_error(Parser *p, const char *msg) {
   fprintf(stderr, "error:%d:%d: %s\n", p->previous.line, p->previous.column, msg);
   p->panic = 1;
+}
+
+static char *strdup_str(const char *s) {
+  size_t len = strlen(s);
+  char *d = malloc(len + 1);
+  if (d) memcpy(d, s, len + 1);
+  return d;
 }
 
 static char *strdup_token(const Token *t) {
