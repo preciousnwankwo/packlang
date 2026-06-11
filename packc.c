@@ -32,6 +32,7 @@ typedef enum {
   TOKEN_BANG_EQUAL,
   TOKEN_LESS_EQUAL,
   TOKEN_GREATER_EQUAL,
+  TOKEN_LET,
   TOKEN_ERROR,
 } TokenType;
 
@@ -80,6 +81,7 @@ static const char *token_name(TokenType t) {
     case TOKEN_BANG_EQUAL:     return "BANG_EQUAL";
     case TOKEN_LESS_EQUAL:     return "LESS_EQUAL";
     case TOKEN_GREATER_EQUAL:  return "GREATER_EQUAL";
+    case TOKEN_LET:            return "LET";
     case TOKEN_ERROR:          return "ERROR";
   }
   return "?";
@@ -162,10 +164,16 @@ static Token lexer_number(Lexer *l) {
   return lexer_make_token(l, TOKEN_NUMBER);
 }
 
+static TokenType lexer_keyword(const char *start, int len) {
+  if (len == 3 && memcmp(start, "let", 3) == 0) return TOKEN_LET;
+  return TOKEN_IDENTIFIER;
+}
+
 static Token lexer_identifier(Lexer *l) {
   while (isalnum(lexer_peek(l)) || lexer_peek(l) == '_')
     lexer_advance(l);
-  return lexer_make_token(l, TOKEN_IDENTIFIER);
+  TokenType type = lexer_keyword(l->start, (int)(l->current - l->start));
+  return lexer_make_token(l, type);
 }
 
 static Token lexer_string(Lexer *l) {
@@ -237,6 +245,9 @@ static void token_print(Token t) {
 }
 
 typedef enum {
+  NODE_PROGRAM,
+  NODE_LET,
+  NODE_VARIABLE,
   NODE_NUMBER,
   NODE_UNARY,
   NODE_BINARY,
@@ -247,6 +258,9 @@ typedef struct Node {
   struct Node *next;
   union {
     int number;
+    struct { char *name; struct Node *value; } let;
+    struct { char *name; } variable;
+    struct { struct Node *stmts; } program;
     struct { TokenType op; struct Node *right; } unary;
     struct { TokenType op; struct Node *left; struct Node *right; } binary;
   } as;
@@ -274,6 +288,9 @@ static void codegen_expr(FILE *out, Node *n) {
     case NODE_NUMBER:
       fprintf(out, "%d", n->as.number);
       break;
+    case NODE_VARIABLE:
+      fprintf(out, "%s", n->as.variable.name);
+      break;
     case NODE_UNARY:
       fprintf(out, "-");
       codegen_expr(out, n->as.unary.right);
@@ -285,18 +302,64 @@ static void codegen_expr(FILE *out, Node *n) {
       codegen_expr(out, n->as.binary.right);
       fprintf(out, ")");
       break;
+    default:
+      break;
+  }
+}
+
+static void codegen_stmt(FILE *out, Node *n) {
+  switch (n->type) {
+    case NODE_LET:
+      fprintf(out, "    int %s = ", n->as.let.name);
+      codegen_expr(out, n->as.let.value);
+      fprintf(out, ";\n");
+      break;
+    default:
+      break;
   }
 }
 
 static void codegen(FILE *out, Node *n) {
-  fprintf(out, "int main(void) {\n    return ");
-  codegen_expr(out, n);
-  fprintf(out, ";\n}\n");
+  if (n->type == NODE_PROGRAM) {
+    fprintf(out, "int main(void) {\n");
+    Node *last = NULL;
+    for (Node *s = n->as.program.stmts; s; s = s->next) {
+      last = s;
+      if (s->type != NODE_LET) continue;
+      codegen_stmt(out, s);
+    }
+    fprintf(out, "    return ");
+    if (last && last->type != NODE_LET)
+      codegen_expr(out, last);
+    else
+      fprintf(out, "0");
+    fprintf(out, ";\n}\n");
+  } else {
+    fprintf(out, "int main(void) {\n    return ");
+    codegen_expr(out, n);
+    fprintf(out, ";\n}\n");
+  }
 }
 
 static void node_print(FILE *out, Node *n) {
   if (!n) { fprintf(out, "()"); return; }
   switch (n->type) {
+    case NODE_PROGRAM:
+      fprintf(out, "(PROGRAM");
+      for (Node *s = n->as.program.stmts; s; s = s->next) {
+        fprintf(out, " ");
+        node_print(out, s);
+      }
+      fprintf(out, ")");
+      break;
+    case NODE_LET:
+      fprintf(out, "(LET %s ", n->as.let.name);
+      node_print(out, n->as.let.value);
+      fprintf(out, ")");
+      break;
+    case NODE_VARIABLE:
+      fprintf(out, "(VAR %s)", n->as.variable.name);
+      break;
     case NODE_NUMBER:
       fprintf(out, "%d", n->as.number);
       break;
@@ -348,9 +411,53 @@ static void parser_error(Parser *p, const char *msg) {
   p->panic = 1;
 }
 
+static char *strdup_token(const Token *t) {
+  char *s = malloc((size_t)t->length + 1);
+  memcpy(s, t->start, (size_t)t->length);
+  s[t->length] = '\0';
+  return s;
+}
+
 static Node *parse_expr(Parser *p);
 static Node *parse_term(Parser *p);
 static Node *parse_factor(Parser *p);
+static Node *parse_statement(Parser *p);
+
+static Node *parse_program(Parser *p) {
+  Node *head = NULL, *tail = NULL;
+  while (!parser_check(p, TOKEN_EOF)) {
+    Node *stmt = parse_statement(p);
+    if (!stmt) break;
+    if (p->panic) return node_new(NODE_PROGRAM);
+    if (!head) head = stmt;
+    else tail->next = stmt;
+    tail = stmt;
+  }
+  Node *prog = node_new(NODE_PROGRAM);
+  prog->as.program.stmts = head;
+  return prog;
+}
+
+static Node *parse_statement(Parser *p) {
+  if (parser_match(p, TOKEN_LET)) {
+    if (!parser_check(p, TOKEN_IDENTIFIER)) {
+      parser_error(p, "Expected variable name");
+      return NULL;
+    }
+    Node *n = node_new(NODE_LET);
+    n->as.let.name = strdup_token(&p->current);
+    parser_advance(p);
+    if (!parser_match(p, TOKEN_EQUAL)) {
+      parser_error(p, "Expected '='");
+      return NULL;
+    }
+    n->as.let.value = parse_expr(p);
+    if (!parser_match(p, TOKEN_SEMICOLON))
+      parser_error(p, "Expected ';'");
+    return n;
+  }
+  return parse_expr(p);
+}
 
 static Node *parse_expr(Parser *p) {
   Node *left = parse_term(p);
@@ -398,17 +505,17 @@ static Node *parse_factor(Parser *p) {
     n->as.number = atoi(p->previous.start);
     return n;
   }
+  if (parser_match(p, TOKEN_IDENTIFIER)) {
+    Node *n = node_new(NODE_VARIABLE);
+    n->as.variable.name = strdup_token(&p->previous);
+    return n;
+  }
   parser_error(p, "Expected expression");
   return NULL;
 }
 
 static Node *parse(Parser *p) {
-  Node *n = parse_expr(p);
-  if (!parser_check(p, TOKEN_EOF)) {
-    parser_error(p, "Unexpected token");
-    while (!parser_check(p, TOKEN_EOF)) parser_advance(p);
-  }
-  return n;
+  return parse_program(p);
 }
 
 static char *read_file(const char *path) {

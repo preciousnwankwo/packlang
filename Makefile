@@ -8,4 +8,6 @@ clean:
 	rm -f packc
 
 test: packc
-	./packc examples/hello.pack
+	./packc examples/hello.pack | head -1
+	./packc --emit-c examples/hello.pack | gcc -x c - -o /tmp/packtest
+	/tmp/packtest; echo "exit: $$?"
