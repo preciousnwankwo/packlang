@@ -1,0 +1,12 @@
+build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+compile_commands.json
+.clangd/
+.vscode/
+.idea/
+.DS_Store
