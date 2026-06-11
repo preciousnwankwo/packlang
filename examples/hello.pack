@@ -1,2 +1,2 @@
 let x = 5;
-x + 3
+if x > 3 { x } else { 0 }

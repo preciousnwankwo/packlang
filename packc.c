@@ -33,6 +33,8 @@ typedef enum {
   TOKEN_LESS_EQUAL,
   TOKEN_GREATER_EQUAL,
   TOKEN_LET,
+  TOKEN_IF,
+  TOKEN_ELSE,
   TOKEN_ERROR,
 } TokenType;
 
@@ -82,6 +84,8 @@ static const char *token_name(TokenType t) {
     case TOKEN_LESS_EQUAL:     return "LESS_EQUAL";
     case TOKEN_GREATER_EQUAL:  return "GREATER_EQUAL";
     case TOKEN_LET:            return "LET";
+    case TOKEN_IF:             return "IF";
+    case TOKEN_ELSE:           return "ELSE";
     case TOKEN_ERROR:          return "ERROR";
   }
   return "?";
@@ -166,6 +170,8 @@ static Token lexer_number(Lexer *l) {
 
 static TokenType lexer_keyword(const char *start, int len) {
   if (len == 3 && memcmp(start, "let", 3) == 0) return TOKEN_LET;
+  if (len == 2 && memcmp(start, "if", 2) == 0) return TOKEN_IF;
+  if (len == 4 && memcmp(start, "else", 4) == 0) return TOKEN_ELSE;
   return TOKEN_IDENTIFIER;
 }
 
@@ -251,6 +257,8 @@ typedef enum {
   NODE_NUMBER,
   NODE_UNARY,
   NODE_BINARY,
+  NODE_IF,
+  NODE_BLOCK,
 } NodeType;
 
 typedef struct Node {
@@ -261,6 +269,8 @@ typedef struct Node {
     struct { char *name; struct Node *value; } let;
     struct { char *name; } variable;
     struct { struct Node *stmts; } program;
+    struct { struct Node *stmts; } block;
+    struct { struct Node *cond; struct Node *then_block; struct Node *else_block; } iff;
     struct { TokenType op; struct Node *right; } unary;
     struct { TokenType op; struct Node *left; struct Node *right; } binary;
   } as;
@@ -273,15 +283,27 @@ static Node *node_new(NodeType type) {
   return n;
 }
 
+static int temp_count = 0;
+
 static const char *op_to_c(TokenType t) {
   switch (t) {
     case TOKEN_PLUS: return "+";
     case TOKEN_MINUS: return "-";
     case TOKEN_STAR: return "*";
     case TOKEN_SLASH: return "/";
+    case TOKEN_EQUAL_EQUAL: return "==";
+    case TOKEN_BANG_EQUAL: return "!=";
+    case TOKEN_LESS: return "<";
+    case TOKEN_GREATER: return ">";
+    case TOKEN_LESS_EQUAL: return "<=";
+    case TOKEN_GREATER_EQUAL: return ">=";
     default: return "?";
   }
 }
+
+static void codegen_expr(FILE *out, Node *n);
+static void codegen_block_stmts(FILE *out, Node *n);
+static void codegen_block_expr(FILE *out, Node *n, int zero_if_empty);
 
 static void codegen_expr(FILE *out, Node *n) {
   switch (n->type) {
@@ -302,9 +324,44 @@ static void codegen_expr(FILE *out, Node *n) {
       codegen_expr(out, n->as.binary.right);
       fprintf(out, ")");
       break;
+    case NODE_IF: {
+      int id = temp_count++;
+      fprintf(out, "({int _t%d; if (", id);
+      codegen_expr(out, n->as.iff.cond);
+      fprintf(out, ") {");
+      codegen_block_stmts(out, n->as.iff.then_block);
+      fprintf(out, " _t%d = ", id);
+      codegen_block_expr(out, n->as.iff.then_block, 0);
+      fprintf(out, "; } else {");
+      codegen_block_stmts(out, n->as.iff.else_block);
+      fprintf(out, " _t%d = ", id);
+      codegen_block_expr(out, n->as.iff.else_block, 0);
+      fprintf(out, "; } _t%d; })", id);
+      break;
+    }
     default:
       break;
   }
+}
+
+static void codegen_block_stmts(FILE *out, Node *n) {
+  for (Node *s = n->as.block.stmts; s; s = s->next) {
+    if (s->type == NODE_LET) {
+      fprintf(out, " int %s = ", s->as.let.name);
+      codegen_expr(out, s->as.let.value);
+      fprintf(out, ";");
+    }
+  }
+}
+
+static void codegen_block_expr(FILE *out, Node *n, int zero_if_empty) {
+  Node *s = n->as.block.stmts;
+  if (!s) { if (zero_if_empty) fprintf(out, "0"); return; }
+  while (s->next) s = s->next;
+  if (s->type == NODE_LET)
+    codegen_expr(out, s->as.let.value);
+  else
+    codegen_expr(out, s);
 }
 
 static void codegen_stmt(FILE *out, Node *n) {
@@ -325,8 +382,8 @@ static void codegen(FILE *out, Node *n) {
     Node *last = NULL;
     for (Node *s = n->as.program.stmts; s; s = s->next) {
       last = s;
-      if (s->type != NODE_LET) continue;
-      codegen_stmt(out, s);
+      if (s->type == NODE_LET || s->type == NODE_IF)
+        codegen_stmt(out, s);
     }
     fprintf(out, "    return ");
     if (last && last->type != NODE_LET)
@@ -349,6 +406,25 @@ static void node_print(FILE *out, Node *n) {
       for (Node *s = n->as.program.stmts; s; s = s->next) {
         fprintf(out, " ");
         node_print(out, s);
+      }
+      fprintf(out, ")");
+      break;
+    case NODE_BLOCK:
+      fprintf(out, "(BLOCK");
+      for (Node *s = n->as.block.stmts; s; s = s->next) {
+        fprintf(out, " ");
+        node_print(out, s);
+      }
+      fprintf(out, ")");
+      break;
+    case NODE_IF:
+      fprintf(out, "(IF ");
+      node_print(out, n->as.iff.cond);
+      fprintf(out, " ");
+      node_print(out, n->as.iff.then_block);
+      if (n->as.iff.else_block) {
+        fprintf(out, " ");
+        node_print(out, n->as.iff.else_block);
       }
       fprintf(out, ")");
       break;
@@ -422,6 +498,7 @@ static Node *parse_expr(Parser *p);
 static Node *parse_term(Parser *p);
 static Node *parse_factor(Parser *p);
 static Node *parse_statement(Parser *p);
+static Node *parse_block(Parser *p);
 
 static Node *parse_program(Parser *p) {
   Node *head = NULL, *tail = NULL;
@@ -456,12 +533,25 @@ static Node *parse_statement(Parser *p) {
       parser_error(p, "Expected ';'");
     return n;
   }
-  return parse_expr(p);
+  Node *expr = parse_expr(p);
+  if (expr && expr->type != NODE_IF)
+    parser_match(p, TOKEN_SEMICOLON);
+  return expr;
 }
 
+static Node *parse_comparison(Parser *p);
+static Node *parse_term(Parser *p);
+static Node *parse_factor(Parser *p);
+
 static Node *parse_expr(Parser *p) {
+  return parse_comparison(p);
+}
+
+static Node *parse_comparison(Parser *p) {
   Node *left = parse_term(p);
-  while (parser_match(p, TOKEN_PLUS) || parser_match(p, TOKEN_MINUS)) {
+  while (parser_match(p, TOKEN_EQUAL_EQUAL) || parser_match(p, TOKEN_BANG_EQUAL) ||
+         parser_match(p, TOKEN_LESS) || parser_match(p, TOKEN_GREATER) ||
+         parser_match(p, TOKEN_LESS_EQUAL) || parser_match(p, TOKEN_GREATER_EQUAL)) {
     TokenType op = p->previous.type;
     Node *right = parse_term(p);
     Node *n = node_new(NODE_BINARY);
@@ -488,6 +578,18 @@ static Node *parse_term(Parser *p) {
 }
 
 static Node *parse_factor(Parser *p) {
+  if (parser_match(p, TOKEN_IF)) {
+    Node *cond = parse_expr(p);
+    Node *then_block = parse_block(p);
+    Node *n = node_new(NODE_IF);
+    n->as.iff.cond = cond;
+    n->as.iff.then_block = then_block;
+    if (parser_match(p, TOKEN_ELSE))
+      n->as.iff.else_block = parse_block(p);
+    else
+      n->as.iff.else_block = NULL;
+    return n;
+  }
   if (parser_match(p, TOKEN_MINUS)) {
     Node *n = node_new(NODE_UNARY);
     n->as.unary.op = TOKEN_MINUS;
@@ -512,6 +614,26 @@ static Node *parse_factor(Parser *p) {
   }
   parser_error(p, "Expected expression");
   return NULL;
+}
+
+static Node *parse_block(Parser *p) {
+  Node *n = node_new(NODE_BLOCK);
+  if (!parser_match(p, TOKEN_LBRACE)) {
+    parser_error(p, "Expected '{'");
+    return NULL;
+  }
+  Node *head = NULL, *tail = NULL;
+  while (!parser_check(p, TOKEN_RBRACE) && !parser_check(p, TOKEN_EOF)) {
+    Node *stmt = parse_statement(p);
+    if (p->panic) { n->as.block.stmts = head; return n; }
+    if (!head) head = stmt;
+    else tail->next = stmt;
+    tail = stmt;
+  }
+  if (!parser_match(p, TOKEN_RBRACE))
+    parser_error(p, "Expected '}'");
+  n->as.block.stmts = head;
+  return n;
 }
 
 static Node *parse(Parser *p) {
