@@ -1,0 +1,4 @@
+fn mul(a, b) {
+  if b == 1 { a } else { a + mul(a, b - 1) }
+}
+mul(5, 3) + 2

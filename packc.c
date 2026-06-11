@@ -70,6 +70,7 @@ typedef enum {
   TOKEN_IF,
   TOKEN_ELSE,
   TOKEN_WHILE,
+  TOKEN_FN,
   TOKEN_ERROR,
 } TokenType;
 
@@ -122,6 +123,7 @@ static const char *token_name(TokenType t) {
     case TOKEN_IF:             return "IF";
     case TOKEN_ELSE:           return "ELSE";
     case TOKEN_WHILE:          return "WHILE";
+    case TOKEN_FN:             return "FN";
     case TOKEN_ERROR:          return "ERROR";
   }
   return "?";
@@ -209,6 +211,7 @@ static TokenType lexer_keyword(const char *start, int len) {
   if (len == 2 && memcmp(start, "if", 2) == 0) return TOKEN_IF;
   if (len == 4 && memcmp(start, "else", 4) == 0) return TOKEN_ELSE;
   if (len == 5 && memcmp(start, "while", 5) == 0) return TOKEN_WHILE;
+  if (len == 2 && memcmp(start, "fn", 2) == 0) return TOKEN_FN;
   return TOKEN_IDENTIFIER;
 }
 
@@ -297,6 +300,8 @@ typedef enum {
   NODE_IF,
   NODE_WHILE,
   NODE_BLOCK,
+  NODE_FN,
+  NODE_CALL,
 } NodeType;
 
 typedef struct Node {
@@ -310,6 +315,8 @@ typedef struct Node {
     struct { struct Node *stmts; } block;
     struct { struct Node *cond; struct Node *then_block; struct Node *else_block; } iff;
     struct { struct Node *cond; struct Node *body; } whilee;
+    struct { char *name; struct Node *params; struct Node *body; } fn;
+    struct { char *name; struct Node *args; } call;
     struct { TokenType op; struct Node *right; } unary;
     struct { TokenType op; struct Node *left; struct Node *right; } binary;
   } as;
@@ -410,6 +417,14 @@ static void codegen_expr(FILE *out, Node *n) {
       fprintf(out, " _t%d; })", id);
       break;
     }
+    case NODE_CALL:
+      fprintf(out, "%s(", n->as.call.name);
+      for (Node *a = n->as.call.args; a; a = a->next) {
+        if (a != n->as.call.args) fprintf(out, ", ");
+        codegen_expr(out, a);
+      }
+      fprintf(out, ")");
+      break;
     case NODE_WHILE:
       fprintf(out, "({while (");
       codegen_expr(out, n->as.whilee.cond);
@@ -474,6 +489,24 @@ static void codegen_stmt(FILE *out, Node *n) {
       codegen_block_all_stmts(out, n->as.whilee.body);
       fprintf(out, " }\n");
       break;
+    case NODE_CALL:
+      fprintf(out, "    ");
+      codegen_expr(out, n);
+      fprintf(out, ";\n");
+      break;
+    case NODE_FN:
+      fprintf(out, "int %s(", n->as.fn.name);
+      Node *p;
+      for (p = n->as.fn.params; p; p = p->next) {
+        if (p != n->as.fn.params) fprintf(out, ", ");
+        fprintf(out, "int %s", p->as.variable.name);
+      }
+      fprintf(out, ") {\n");
+      codegen_block_stmts(out, n->as.fn.body);
+      fprintf(out, "    return ");
+      codegen_block_expr(out, n->as.fn.body, 1);
+      fprintf(out, ";\n}\n");
+      break;
     default:
       break;
   }
@@ -481,22 +514,22 @@ static void codegen_stmt(FILE *out, Node *n) {
 
 static void codegen(FILE *out, Node *n) {
   if (n->type == NODE_PROGRAM) {
+    for (Node *s = n->as.program.stmts; s; s = s->next)
+      if (s->type == NODE_FN) codegen_stmt(out, s);
     fprintf(out, "int main(void) {\n");
     Node *last = NULL;
     for (Node *s = n->as.program.stmts; s; s = s->next) {
       last = s;
       if (s->type == NODE_LET)
         codegen_stmt(out, s);
+      else if (s->type != NODE_FN && s->next)
+        codegen_stmt(out, s);
     }
     fprintf(out, "    return ");
-    if (last && last->type != NODE_LET)
+    if (last && last->type != NODE_LET && last->type != NODE_FN)
       codegen_expr(out, last);
     else
       fprintf(out, "0");
-    fprintf(out, ";\n}\n");
-  } else {
-    fprintf(out, "int main(void) {\n    return ");
-    codegen_expr(out, n);
     fprintf(out, ";\n}\n");
   }
 }
@@ -536,6 +569,22 @@ static void node_print(FILE *out, Node *n) {
         fprintf(out, " ");
         node_print(out, n->as.iff.else_block);
       }
+      fprintf(out, ")");
+      break;
+    case NODE_CALL:
+      fprintf(out, "(CALL %s", n->as.call.name);
+      for (Node *a = n->as.call.args; a; a = a->next) {
+        fprintf(out, " ");
+        node_print(out, a);
+      }
+      fprintf(out, ")");
+      break;
+    case NODE_FN:
+      fprintf(out, "(FN %s", n->as.fn.name);
+      for (Node *p = n->as.fn.params; p; p = p->next)
+        fprintf(out, " (PARAM %s)", p->as.variable.name);
+      fprintf(out, " ");
+      node_print(out, n->as.fn.body);
       fprintf(out, ")");
       break;
     case NODE_LET:
@@ -635,7 +684,14 @@ static Node *parse_program(Parser *p) {
   return prog;
 }
 
+static Node *parse_fn(Parser *p);
+
 static Node *parse_statement(Parser *p) {
+  if (parser_match(p, TOKEN_FN)) {
+    Node *n = parse_fn(p);
+    if (n) parser_match(p, TOKEN_SEMICOLON);
+    return n;
+  }
   if (parser_match(p, TOKEN_LET)) {
     if (!parser_check(p, TOKEN_IDENTIFIER)) {
       parser_error(p, "Expected variable name");
@@ -666,6 +722,62 @@ static Node *parse_statement(Parser *p) {
   if (expr && expr->type != NODE_IF && expr->type != NODE_WHILE && expr->type != NODE_BLOCK)
     parser_match(p, TOKEN_SEMICOLON);
   return expr;
+}
+
+static Node *parse_fn(Parser *p) {
+  if (!parser_check(p, TOKEN_IDENTIFIER)) {
+    parser_error(p, "Expected function name");
+    return NULL;
+  }
+  char *name = strdup_token(&p->current);
+  parser_advance(p);
+  if (!sym_define(&p->sym, name)) {
+    fprintf(stderr, "error:%d:%d: Duplicate function '%s'\n",
+            p->previous.line, p->previous.column, name);
+    p->panic = 1;
+    free(name);
+    return NULL;
+  }
+  if (!parser_match(p, TOKEN_LPAREN)) {
+    parser_error(p, "Expected '('");
+    return NULL;
+  }
+  sym_push(&p->sym);
+  Node *params_head = NULL, *params_tail = NULL;
+  if (!parser_check(p, TOKEN_RPAREN)) {
+    do {
+      if (!parser_check(p, TOKEN_IDENTIFIER)) {
+        parser_error(p, "Expected parameter name");
+        return NULL;
+      }
+      char *pname = strdup_token(&p->current);
+      parser_advance(p);
+      if (!sym_define(&p->sym, pname)) {
+        fprintf(stderr, "error:%d:%d: Duplicate parameter '%s'\n",
+                p->previous.line, p->previous.column, pname);
+        p->panic = 1;
+        free(pname);
+        return NULL;
+      }
+      Node *pn = node_new(NODE_VARIABLE);
+      pn->as.variable.name = pname;
+      if (!params_head) params_head = pn;
+      else params_tail->next = pn;
+      params_tail = pn;
+    } while (parser_match(p, TOKEN_COMMA));
+  }
+  if (!parser_match(p, TOKEN_RPAREN)) {
+    parser_error(p, "Expected ')'");
+    sym_pop(&p->sym);
+    return NULL;
+  }
+  Node *body = parse_block(p);
+  sym_pop(&p->sym);
+  Node *n = node_new(NODE_FN);
+  n->as.fn.name = name;
+  n->as.fn.params = params_head;
+  n->as.fn.body = body;
+  return n;
 }
 
 static Node *parse_expr(Parser *p) {
@@ -756,6 +868,24 @@ static Node *parse_factor(Parser *p) {
   }
   if (parser_match(p, TOKEN_IDENTIFIER)) {
     char *name = strdup_token(&p->previous);
+    if (parser_match(p, TOKEN_LPAREN)) {
+      Node *args_head = NULL, *args_tail = NULL;
+      if (!parser_check(p, TOKEN_RPAREN)) {
+        do {
+          Node *arg = parse_expr(p);
+          if (!arg || p->panic) break;
+          if (!args_head) args_head = arg;
+          else args_tail->next = arg;
+          args_tail = arg;
+        } while (parser_match(p, TOKEN_COMMA));
+      }
+      if (!parser_match(p, TOKEN_RPAREN))
+        parser_error(p, "Expected ')'");
+      Node *n = node_new(NODE_CALL);
+      n->as.call.name = name;
+      n->as.call.args = args_head;
+      return n;
+    }
     if (!sym_lookup(&p->sym, name)) {
       fprintf(stderr, "error:%d:%d: Undefined variable '%s'\n",
               p->previous.line, p->previous.column, name);
