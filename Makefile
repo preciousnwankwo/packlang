@@ -15,3 +15,5 @@ test: packc
 	/tmp/packtest; echo "exit: $$?"
 	./packc --emit-c examples/while.pack | gcc -x c - -o /tmp/packtest 2>/dev/null
 	/tmp/packtest; echo "exit: $$?"
+	./packc --emit-c examples/scope.pack | gcc -x c - -o /tmp/packtest 2>/dev/null
+	/tmp/packtest; echo "exit: $$?"

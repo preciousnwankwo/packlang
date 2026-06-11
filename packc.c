@@ -3,6 +3,38 @@
 #include <string.h>
 #include <ctype.h>
 
+#define MAX_SCOPE 64
+#define MAX_VARS_PER_SCOPE 64
+
+typedef struct {
+  char *names[MAX_VARS_PER_SCOPE];
+  int count;
+} Scope;
+
+typedef struct {
+  Scope scopes[MAX_SCOPE];
+  int depth;
+} SymTable;
+
+static void sym_init(SymTable *st) { st->depth = 0; st->scopes[0].count = 0; }
+static void sym_push(SymTable *st) { st->depth++; st->scopes[st->depth].count = 0; }
+static void sym_pop(SymTable *st) { st->depth--; }
+
+static int sym_lookup(SymTable *st, const char *name) {
+  for (int d = st->depth; d >= 0; d--)
+    for (int i = 0; i < st->scopes[d].count; i++)
+      if (strcmp(st->scopes[d].names[i], name) == 0) return 1;
+  return 0;
+}
+
+static int sym_define(SymTable *st, const char *name) {
+  Scope *s = &st->scopes[st->depth];
+  for (int i = 0; i < s->count; i++)
+    if (strcmp(s->names[i], name) == 0) return 0;
+  s->names[s->count++] = strdup(name);
+  return 1;
+}
+
 typedef enum {
   TOKEN_EOF,
   TOKEN_NUMBER,
@@ -345,6 +377,37 @@ static void codegen_expr(FILE *out, Node *n) {
       fprintf(out, "; } _t%d; })", id);
       break;
     }
+    case NODE_BLOCK: {
+      int id = temp_count++;
+      fprintf(out, "({int _t%d; ", id);
+      Node *s;
+      for (s = n->as.block.stmts; s && s->next; s = s->next) {
+        if (s->type == NODE_LET) {
+          fprintf(out, "int %s = ", s->as.let.name);
+          codegen_expr(out, s->as.let.value);
+          fprintf(out, "; ");
+        } else {
+          codegen_expr(out, s);
+          fprintf(out, "; ");
+        }
+      }
+      if (s) {
+        if (s->type == NODE_LET) {
+          fprintf(out, "int %s = ", s->as.let.name);
+          codegen_expr(out, s->as.let.value);
+          fprintf(out, "; _t%d = ", id);
+          codegen_expr(out, s->as.let.value);
+        } else {
+          fprintf(out, "_t%d = ", id);
+          codegen_expr(out, s);
+        }
+        fprintf(out, ";");
+      } else {
+        fprintf(out, "_t%d = 0;", id);
+      }
+      fprintf(out, " _t%d; })", id);
+      break;
+    }
     case NODE_WHILE:
       fprintf(out, "({while (");
       codegen_expr(out, n->as.whilee.cond);
@@ -504,12 +567,14 @@ typedef struct {
   Token current;
   Token previous;
   int panic;
+  SymTable sym;
 } Parser;
 
 static void parser_init(Parser *p, Lexer *l) {
   p->lexer = l;
   p->panic = 0;
   p->current = lexer_next(l);
+  sym_init(&p->sym);
 }
 
 static void parser_advance(Parser *p) {
@@ -567,9 +632,18 @@ static Node *parse_statement(Parser *p) {
       parser_error(p, "Expected variable name");
       return NULL;
     }
-    Node *n = node_new(NODE_LET);
-    n->as.let.name = strdup_token(&p->current);
+    Token name_tok = p->current;
+    char *name = strdup_token(&p->current);
     parser_advance(p);
+    if (!sym_define(&p->sym, name)) {
+      fprintf(stderr, "error:%d:%d: Duplicate variable '%s'\n",
+              name_tok.line, name_tok.column, name);
+      p->panic = 1;
+      free(name);
+      return NULL;
+    }
+    Node *n = node_new(NODE_LET);
+    n->as.let.name = name;
     if (!parser_match(p, TOKEN_EQUAL)) {
       parser_error(p, "Expected '='");
       return NULL;
@@ -580,7 +654,7 @@ static Node *parse_statement(Parser *p) {
     return n;
   }
   Node *expr = parse_expr(p);
-  if (expr && expr->type != NODE_IF && expr->type != NODE_WHILE)
+  if (expr && expr->type != NODE_IF && expr->type != NODE_WHILE && expr->type != NODE_BLOCK)
     parser_match(p, TOKEN_SEMICOLON);
   return expr;
 }
@@ -629,7 +703,11 @@ static Node *parse_term(Parser *p) {
   return left;
 }
 
+static Node *parse_block_body(Parser *p);
+
 static Node *parse_factor(Parser *p) {
+  if (parser_match(p, TOKEN_LBRACE))
+    return parse_block_body(p);
   if (parser_match(p, TOKEN_WHILE)) {
     Node *cond = parse_expr(p);
     Node *body = parse_block(p);
@@ -668,33 +746,47 @@ static Node *parse_factor(Parser *p) {
     return n;
   }
   if (parser_match(p, TOKEN_IDENTIFIER)) {
+    char *name = strdup_token(&p->previous);
+    if (!sym_lookup(&p->sym, name)) {
+      fprintf(stderr, "error:%d:%d: Undefined variable '%s'\n",
+              p->previous.line, p->previous.column, name);
+      p->panic = 1;
+      free(name);
+      return NULL;
+    }
     Node *n = node_new(NODE_VARIABLE);
-    n->as.variable.name = strdup_token(&p->previous);
+    n->as.variable.name = name;
     return n;
   }
   parser_error(p, "Expected expression");
   return NULL;
 }
 
-static Node *parse_block(Parser *p) {
+static Node *parse_block_body(Parser *p) {
   Node *n = node_new(NODE_BLOCK);
-  if (!parser_match(p, TOKEN_LBRACE)) {
-    parser_error(p, "Expected '{'");
-    return NULL;
-  }
+  sym_push(&p->sym);
   Node *head = NULL, *tail = NULL;
   while (!parser_check(p, TOKEN_RBRACE) && !parser_check(p, TOKEN_EOF)) {
     Node *stmt = parse_statement(p);
-    if (p->panic) { n->as.block.stmts = head; return n; }
+    if (p->panic) { sym_pop(&p->sym); n->as.block.stmts = head; return n; }
     if (!stmt) break;
     if (!head) head = stmt;
     else tail->next = stmt;
     tail = stmt;
   }
+  sym_pop(&p->sym);
   if (!parser_match(p, TOKEN_RBRACE))
     parser_error(p, "Expected '}'");
   n->as.block.stmts = head;
   return n;
+}
+
+static Node *parse_block(Parser *p) {
+  if (!parser_match(p, TOKEN_LBRACE)) {
+    parser_error(p, "Expected '{'");
+    return NULL;
+  }
+  return parse_block_body(p);
 }
 
 static Node *parse(Parser *p) {
