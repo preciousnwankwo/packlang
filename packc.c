@@ -259,6 +259,41 @@ static Node *node_new(NodeType type) {
   return n;
 }
 
+static const char *op_to_c(TokenType t) {
+  switch (t) {
+    case TOKEN_PLUS: return "+";
+    case TOKEN_MINUS: return "-";
+    case TOKEN_STAR: return "*";
+    case TOKEN_SLASH: return "/";
+    default: return "?";
+  }
+}
+
+static void codegen_expr(FILE *out, Node *n) {
+  switch (n->type) {
+    case NODE_NUMBER:
+      fprintf(out, "%d", n->as.number);
+      break;
+    case NODE_UNARY:
+      fprintf(out, "-");
+      codegen_expr(out, n->as.unary.right);
+      break;
+    case NODE_BINARY:
+      fprintf(out, "(");
+      codegen_expr(out, n->as.binary.left);
+      fprintf(out, " %s ", op_to_c(n->as.binary.op));
+      codegen_expr(out, n->as.binary.right);
+      fprintf(out, ")");
+      break;
+  }
+}
+
+static void codegen(FILE *out, Node *n) {
+  fprintf(out, "int main(void) {\n    return ");
+  codegen_expr(out, n);
+  fprintf(out, ";\n}\n");
+}
+
 static void node_print(FILE *out, Node *n) {
   if (!n) { fprintf(out, "()"); return; }
   switch (n->type) {
@@ -394,19 +429,19 @@ static char *read_file(const char *path) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: packc [--tokens] <file.pack>\n");
+    fprintf(stderr, "Usage: packc [--tokens|--emit-c] <file.pack>\n");
     return 1;
   }
-  int tokens_only = 0;
+  int mode = 0; // 0 = ast, 1 = tokens, 2 = emit-c
   const char *path = argv[1];
-  if (argc >= 3 && strcmp(argv[1], "--tokens") == 0) {
-    tokens_only = 1;
-    path = argv[2];
+  if (argc >= 3) {
+    if (strcmp(argv[1], "--tokens") == 0) { mode = 1; path = argv[2]; }
+    if (strcmp(argv[1], "--emit-c") == 0) { mode = 2; path = argv[2]; }
   }
   char *src = read_file(path);
   Lexer lexer;
   lexer_init(&lexer, src);
-  if (tokens_only) {
+  if (mode == 1) {
     Token t;
     int errors = 0;
     for (;;) {
@@ -422,8 +457,12 @@ int main(int argc, char **argv) {
   parser_init(&parser, &lexer);
   Node *ast = parse(&parser);
   if (parser.panic) { free(src); return 1; }
-  node_print(stdout, ast);
-  printf("\n");
+  if (mode == 2) {
+    codegen(stdout, ast);
+  } else {
+    node_print(stdout, ast);
+    printf("\n");
+  }
   free(src);
   return 0;
 }
