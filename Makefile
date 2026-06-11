@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -Wall -Wextra -std=c23
+CFLAGS = -Wall -Wextra -std=c99
 
 packc: packc.c
 	$(CC) $(CFLAGS) -o packc packc.c
