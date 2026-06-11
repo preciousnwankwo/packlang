@@ -420,7 +420,7 @@ static void codegen(FILE *out, Node *n) {
     Node *last = NULL;
     for (Node *s = n->as.program.stmts; s; s = s->next) {
       last = s;
-      if (s->type == NODE_LET || s->type == NODE_IF || s->type == NODE_WHILE)
+      if (s->type == NODE_LET)
         codegen_stmt(out, s);
     }
     fprintf(out, "    return ");
