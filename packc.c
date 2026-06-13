@@ -50,6 +50,8 @@ typedef enum {
   TOKEN_RPAREN,
   TOKEN_LBRACE,
   TOKEN_RBRACE,
+  TOKEN_LBRACKET,
+  TOKEN_RBRACKET,
   TOKEN_SEMICOLON,
   TOKEN_COMMA,
   TOKEN_COLON,
@@ -105,6 +107,8 @@ static const char *token_name(TokenType t) {
     case TOKEN_RPAREN:         return "RPAREN";
     case TOKEN_LBRACE:         return "LBRACE";
     case TOKEN_RBRACE:         return "RBRACE";
+    case TOKEN_LBRACKET:       return "LBRACKET";
+    case TOKEN_RBRACKET:       return "RBRACKET";
     case TOKEN_SEMICOLON:      return "SEMICOLON";
     case TOKEN_COMMA:          return "COMMA";
     case TOKEN_COLON:          return "COLON";
@@ -257,6 +261,8 @@ static Token lexer_next(Lexer *l) {
     case ')': return lexer_make_token(l, TOKEN_RPAREN);
     case '{': return lexer_make_token(l, TOKEN_LBRACE);
     case '}': return lexer_make_token(l, TOKEN_RBRACE);
+    case '[': return lexer_make_token(l, TOKEN_LBRACKET);
+    case ']': return lexer_make_token(l, TOKEN_RBRACKET);
     case ';': return lexer_make_token(l, TOKEN_SEMICOLON);
     case ',': return lexer_make_token(l, TOKEN_COMMA);
     case ':': return lexer_make_token(l, TOKEN_COLON);
@@ -300,13 +306,15 @@ typedef enum {
   TYPE_VOID,
   TYPE_INT,
   TYPE_STR,
+  TYPE_ARRAY,
 } TypeKind;
 
 static const char *type_name(TypeKind t) {
   switch (t) {
-    case TYPE_INT: return "int";
-    case TYPE_STR: return "str";
-    default:       return "void";
+    case TYPE_INT:   return "int";
+    case TYPE_STR:   return "str";
+    case TYPE_ARRAY: return "array";
+    default:         return "void";
   }
 }
 
@@ -323,6 +331,8 @@ typedef enum {
   NODE_FN,
   NODE_CALL,
   NODE_STRING,
+  NODE_ARRAY,
+  NODE_INDEX,
 } NodeType;
 
 typedef struct Node {
@@ -331,14 +341,16 @@ typedef struct Node {
   union {
     int number;
     char *string;
-    struct { char *name; TypeKind type; struct Node *value; } let;
-    struct { char *name; TypeKind type; } variable;
+    struct { char *name; TypeKind type; TypeKind elem_type; struct Node *value; } let;
+    struct { char *name; TypeKind type; TypeKind elem_type; } variable;
     struct { struct Node *stmts; } program;
     struct { struct Node *stmts; } block;
     struct { struct Node *cond; struct Node *then_block; struct Node *else_block; } iff;
     struct { struct Node *cond; struct Node *body; } whilee;
-    struct { char *name; TypeKind ret_type; struct Node *params; struct Node *body; } fn;
+    struct { char *name; TypeKind ret_type; TypeKind ret_elem_type; struct Node *params; struct Node *body; } fn;
     struct { char *name; struct Node *args; } call;
+    struct { TypeKind elem_type; struct Node *elements; } array;
+    struct { struct Node *array; struct Node *index; TypeKind elem_type; } indexx;
     struct { TokenType op; struct Node *right; } unary;
     struct { TokenType op; TypeKind type; struct Node *left; struct Node *right; } binary;
   } as;
@@ -451,6 +463,22 @@ static void codegen_expr(FILE *out, Node *n) {
     case NODE_STRING:
       fprintf(out, "\"%s\"", n->as.string);
       break;
+    case NODE_ARRAY: {
+      fprintf(out, "{");
+      for (Node *e = n->as.array.elements; e; e = e->next) {
+        if (e != n->as.array.elements) fprintf(out, ", ");
+        codegen_expr(out, e);
+      }
+      fprintf(out, "}");
+      break;
+    }
+    case NODE_INDEX:
+      fprintf(out, "(");
+      codegen_expr(out, n->as.indexx.array);
+      fprintf(out, ")[");
+      codegen_expr(out, n->as.indexx.index);
+      fprintf(out, "]");
+      break;
     case NODE_CALL:
       fprintf(out, "%s(", n->as.call.name);
       for (Node *a = n->as.call.args; a; a = a->next) {
@@ -508,9 +536,20 @@ static void codegen_block_expr(FILE *out, Node *n, int zero_if_empty) {
 static void codegen_stmt(FILE *out, Node *n) {
   switch (n->type) {
     case NODE_LET:
-      fprintf(out, "    %s %s = ", n->as.let.type == TYPE_STR ? "char*" : "int", n->as.let.name);
-      codegen_expr(out, n->as.let.value);
-      fprintf(out, ";\n");
+      if (n->as.let.type == TYPE_ARRAY) {
+        Node *val = n->as.let.value;
+        int count = 0;
+        if (val && val->type == NODE_ARRAY)
+          for (Node *e = val->as.array.elements; e; e = e->next) count++;
+        const char *ct = n->as.let.elem_type == TYPE_STR ? "char*" : "int";
+        fprintf(out, "    %s %s[%d] = ", ct, n->as.let.name, count);
+        codegen_expr(out, n->as.let.value);
+        fprintf(out, ";\n");
+      } else {
+        fprintf(out, "    %s %s = ", n->as.let.type == TYPE_STR ? "char*" : "int", n->as.let.name);
+        codegen_expr(out, n->as.let.value);
+        fprintf(out, ";\n");
+      }
       break;
     case NODE_IF:
       codegen_expr(out, n);
@@ -529,12 +568,17 @@ static void codegen_stmt(FILE *out, Node *n) {
       fprintf(out, ";\n");
       break;
     case NODE_FN:
-      fprintf(out, "%s %s(", n->as.fn.ret_type == TYPE_STR ? "char*" : "int", n->as.fn.name);
+      fprintf(out, "%s %s(",
+              n->as.fn.ret_type == TYPE_STR ? "char*" :
+              n->as.fn.ret_type == TYPE_ARRAY ? "int*" : "int",
+              n->as.fn.name);
       Node *p;
       for (p = n->as.fn.params; p; p = p->next) {
         if (p != n->as.fn.params) fprintf(out, ", ");
-        const char *ct = p->as.variable.type == TYPE_STR ? "char*" : "int";
+        const char *ct = p->as.variable.type == TYPE_STR ? "char*" :
+                         p->as.variable.type == TYPE_ARRAY ? "int" : "int";
         fprintf(out, "%s %s", ct, p->as.variable.name);
+        if (p->as.variable.type == TYPE_ARRAY) fprintf(out, "[]");
       }
       fprintf(out, ") {\n");
       codegen_block_stmts(out, n->as.fn.body);
@@ -623,10 +667,15 @@ static void node_print(FILE *out, Node *n) {
       fprintf(out, "(FN %s", n->as.fn.name);
       for (Node *p = n->as.fn.params; p; p = p->next) {
         fprintf(out, " (PARAM %s", p->as.variable.name);
-        if (p->as.variable.type) fprintf(out, " :%s", type_name(p->as.variable.type));
+        if (p->as.variable.type == TYPE_ARRAY)
+          fprintf(out, " :[%s]", type_name(p->as.variable.elem_type));
+        else if (p->as.variable.type)
+          fprintf(out, " :%s", type_name(p->as.variable.type));
         fprintf(out, ")");
       }
-      if (n->as.fn.ret_type)
+      if (n->as.fn.ret_type == TYPE_ARRAY)
+        fprintf(out, " ->[%s]", type_name(n->as.fn.ret_elem_type));
+      else if (n->as.fn.ret_type)
         fprintf(out, " ->%s", type_name(n->as.fn.ret_type));
       fprintf(out, " ");
       node_print(out, n->as.fn.body);
@@ -634,21 +683,42 @@ static void node_print(FILE *out, Node *n) {
       break;
     case NODE_LET:
       fprintf(out, "(LET %s", n->as.let.name);
-      if (n->as.let.type) fprintf(out, " :%s", type_name(n->as.let.type));
+      if (n->as.let.type == TYPE_ARRAY)
+        fprintf(out, " :[%s]", type_name(n->as.let.elem_type));
+      else if (n->as.let.type)
+        fprintf(out, " :%s", type_name(n->as.let.type));
       fprintf(out, " ");
       node_print(out, n->as.let.value);
       fprintf(out, ")");
       break;
     case NODE_VARIABLE:
       fprintf(out, "(VAR %s", n->as.variable.name);
-      if (n->as.variable.type) fprintf(out, " :%s", type_name(n->as.variable.type));
+      if (n->as.variable.type == TYPE_ARRAY)
+        fprintf(out, " :[%s]", type_name(n->as.variable.elem_type));
+      else if (n->as.variable.type)
+        fprintf(out, " :%s", type_name(n->as.variable.type));
       fprintf(out, ")");
       break;
-    case NODE_STRING:
-      fprintf(out, "\"%s\"", n->as.string);
+    case NODE_ARRAY:
+      fprintf(out, "([");
+      for (Node *e = n->as.array.elements; e; e = e->next) {
+        if (e != n->as.array.elements) fprintf(out, " ");
+        node_print(out, e);
+      }
+      fprintf(out, "])");
+      break;
+    case NODE_INDEX:
+      fprintf(out, "(INDEX ");
+      node_print(out, n->as.indexx.array);
+      fprintf(out, " ");
+      node_print(out, n->as.indexx.index);
+      fprintf(out, ")");
       break;
     case NODE_NUMBER:
       fprintf(out, "%d", n->as.number);
+      break;
+    case NODE_STRING:
+      fprintf(out, "\"%s\"", n->as.string);
       break;
     case NODE_UNARY:
       fprintf(out, "(%s ", token_name(n->as.unary.op));
@@ -736,10 +806,17 @@ static Node *parse_program(Parser *p) {
   return prog;
 }
 
-static TypeKind parse_type(Parser *p) {
+static TypeKind parse_type(Parser *p, TypeKind *elem_type) {
   if (parser_match(p, TOKEN_INT)) return TYPE_INT;
   if (parser_match(p, TOKEN_STR)) return TYPE_STR;
-  parser_error(p, "Expected type (int or str)");
+  if (parser_match(p, TOKEN_LBRACKET)) {
+    TypeKind et = parse_type(p, NULL);
+    if (!parser_match(p, TOKEN_RBRACKET))
+      parser_error(p, "Expected ']'");
+    if (elem_type) *elem_type = et;
+    return TYPE_ARRAY;
+  }
+  parser_error(p, "Expected type (int, str, or [type])");
   return TYPE_VOID;
 }
 
@@ -769,8 +846,9 @@ static Node *parse_statement(Parser *p) {
     Node *n = node_new(NODE_LET);
     n->as.let.name = name;
     n->as.let.type = TYPE_INT;
+    n->as.let.elem_type = TYPE_VOID;
     if (parser_match(p, TOKEN_COLON))
-      n->as.let.type = parse_type(p);
+      n->as.let.type = parse_type(p, &n->as.let.elem_type);
     if (!parser_match(p, TOKEN_EQUAL)) {
       parser_error(p, "Expected '='");
       return NULL;
@@ -822,11 +900,13 @@ static Node *parse_fn(Parser *p) {
         return NULL;
       }
       TypeKind pt = TYPE_INT;
+      TypeKind pet = TYPE_VOID;
       if (parser_match(p, TOKEN_COLON))
-        pt = parse_type(p);
+        pt = parse_type(p, &pet);
       Node *pn = node_new(NODE_VARIABLE);
       pn->as.variable.name = pname;
       pn->as.variable.type = pt;
+      pn->as.variable.elem_type = pet;
       if (!params_head) params_head = pn;
       else params_tail->next = pn;
       params_tail = pn;
@@ -838,13 +918,15 @@ static Node *parse_fn(Parser *p) {
     return NULL;
   }
   TypeKind ret_type = TYPE_INT;
+  TypeKind ret_elem_type = TYPE_VOID;
   if (parser_match(p, TOKEN_ARROW))
-    ret_type = parse_type(p);
+    ret_type = parse_type(p, &ret_elem_type);
   Node *body = parse_block(p);
   sym_pop(&p->sym);
   Node *n = node_new(NODE_FN);
   n->as.fn.name = name;
   n->as.fn.ret_type = ret_type;
+  n->as.fn.ret_elem_type = ret_elem_type;
   n->as.fn.params = params_head;
   n->as.fn.body = body;
   return n;
@@ -880,11 +962,13 @@ static Node *parse_comparison(Parser *p) {
   return left;
 }
 
+static Node *parse_index(Parser *p);
+
 static Node *parse_term(Parser *p) {
-  Node *left = parse_factor(p);
+  Node *left = parse_index(p);
   while (parser_match(p, TOKEN_STAR) || parser_match(p, TOKEN_SLASH)) {
     TokenType op = p->previous.type;
-    Node *right = parse_factor(p);
+    Node *right = parse_index(p);
     Node *n = node_new(NODE_BINARY);
     n->as.binary.op = op;
     n->as.binary.left = left;
@@ -894,9 +978,42 @@ static Node *parse_term(Parser *p) {
   return left;
 }
 
+static Node *parse_index(Parser *p) {
+  Node *n = parse_factor(p);
+  while (parser_match(p, TOKEN_LBRACKET)) {
+    Node *idx = parse_expr(p);
+    if (!parser_match(p, TOKEN_RBRACKET))
+      parser_error(p, "Expected ']'");
+    Node *in = node_new(NODE_INDEX);
+    in->as.indexx.array = n;
+    in->as.indexx.index = idx;
+    n = in;
+  }
+  return n;
+}
+
 static Node *parse_block_body(Parser *p);
 
 static Node *parse_factor(Parser *p) {
+  if (parser_match(p, TOKEN_LBRACKET)) {
+    Node *head = NULL, *tail = NULL;
+    if (!parser_check(p, TOKEN_RBRACKET)) {
+      do {
+        Node *elem = parse_expr(p);
+        if (!elem || p->panic) break;
+        if (!head) head = elem;
+        else tail->next = elem;
+        tail = elem;
+      } while (parser_match(p, TOKEN_COMMA));
+    }
+    if (!parser_match(p, TOKEN_RBRACKET))
+      parser_error(p, "Expected ']'");
+    Node *n = node_new(NODE_ARRAY);
+    n->as.array.elements = head;
+    return n;
+  }
+  if (parser_match(p, TOKEN_LBRACE))
+    return parse_block_body(p);
   if (parser_match(p, TOKEN_LBRACE))
     return parse_block_body(p);
   if (parser_match(p, TOKEN_WHILE)) {
@@ -922,7 +1039,7 @@ static Node *parse_factor(Parser *p) {
   if (parser_match(p, TOKEN_MINUS)) {
     Node *n = node_new(NODE_UNARY);
     n->as.unary.op = TOKEN_MINUS;
-    n->as.unary.right = parse_factor(p);
+    n->as.unary.right = parse_index(p);
     return n;
   }
   if (parser_match(p, TOKEN_LPAREN)) {
@@ -1028,7 +1145,7 @@ static char *read_file(const char *path) {
 
 // --- Type Checker ---
 
-typedef struct { char *name; TypeKind type; } TyEntry;
+typedef struct { char *name; TypeKind type; TypeKind elem_type; } TyEntry;
 typedef struct { TyEntry entries[MAX_VARS_PER_SCOPE]; int count; } TyScope;
 typedef struct {
   TyScope scopes[MAX_SCOPE];
@@ -1049,10 +1166,11 @@ static void ty_env_init(TyEnv *env) { env->depth = 0; env->scopes[0].count = 0; 
 static void ty_env_push(TyEnv *env) { env->depth++; env->scopes[env->depth].count = 0; }
 static void ty_env_pop(TyEnv *env) { env->depth--; }
 
-static void ty_env_set(TyEnv *env, const char *name, TypeKind t) {
+static void ty_env_set(TyEnv *env, const char *name, TypeKind t, TypeKind elem) {
   TyScope *s = &env->scopes[env->depth];
   s->entries[s->count].name = strdup_str(name);
   s->entries[s->count].type = t;
+  s->entries[s->count].elem_type = elem;
   s->count++;
 }
 
@@ -1061,6 +1179,14 @@ static TypeKind ty_env_get(TyEnv *env, const char *name) {
     for (int i = 0; i < env->scopes[d].count; i++)
       if (strcmp(env->scopes[d].entries[i].name, name) == 0)
         return env->scopes[d].entries[i].type;
+  return TYPE_VOID;
+}
+
+static TypeKind ty_env_get_elem(TyEnv *env, const char *name) {
+  for (int d = env->depth; d >= 0; d--)
+    for (int i = 0; i < env->scopes[d].count; i++)
+      if (strcmp(env->scopes[d].entries[i].name, name) == 0)
+        return env->scopes[d].entries[i].elem_type;
   return TYPE_VOID;
 }
 
@@ -1081,6 +1207,44 @@ static TypeKind type_check_expr(TyEnv *env, Node *n) {
       return TYPE_INT;
     case NODE_STRING:
       return TYPE_STR;
+    case NODE_ARRAY: {
+      TypeKind et = TYPE_INT;
+      for (Node *e = n->as.array.elements; e; e = e->next) {
+        TypeKind t = type_check_expr(env, e);
+        if (e == n->as.array.elements) {
+          et = t;
+        } else if (t != et) {
+          type_errors++;
+          fprintf(stderr, "type error: array element type mismatch, expected %s got %s\n",
+                  type_name(et), type_name(t));
+        }
+      }
+      n->as.array.elem_type = et;
+      return TYPE_ARRAY;
+    }
+    case NODE_INDEX: {
+      Node *arr = n->as.indexx.array;
+      TypeKind at = type_check_expr(env, arr);
+      if (at != TYPE_ARRAY) {
+        type_errors++;
+        fprintf(stderr, "type error: index target must be array, got %s\n", type_name(at));
+        return TYPE_VOID;
+      }
+      TypeKind it = type_check_expr(env, n->as.indexx.index);
+      if (it != TYPE_INT) {
+        type_errors++;
+        fprintf(stderr, "type error: index must be int, got %s\n", type_name(it));
+      }
+      TypeKind et = TYPE_INT;
+      if (arr->type == NODE_VARIABLE)
+        et = ty_env_get_elem(env, arr->as.variable.name);
+      else if (arr->type == NODE_ARRAY)
+        et = arr->as.array.elem_type;
+      else if (arr->type == NODE_INDEX)
+        et = arr->as.indexx.elem_type;
+      n->as.indexx.elem_type = et;
+      return et;
+    }
     case NODE_VARIABLE: {
       TypeKind t = ty_env_get(env, n->as.variable.name);
       if (t == TYPE_VOID) {
@@ -1088,6 +1252,8 @@ static TypeKind type_check_expr(TyEnv *env, Node *n) {
         fprintf(stderr, "type error: undeclared variable '%s'\n", n->as.variable.name);
         return TYPE_VOID;
       }
+      if (t == TYPE_ARRAY)
+        n->as.variable.elem_type = ty_env_get_elem(env, n->as.variable.name);
       return t;
     }
     case NODE_UNARY: {
@@ -1201,7 +1367,7 @@ static TypeKind type_check_block(TyEnv *env, Node *n) {
         fprintf(stderr, "type error: let '%s' declared as %s but initializer is %s\n",
                 s->as.let.name, type_name(s->as.let.type), type_name(vt));
       }
-      ty_env_set(env, s->as.let.name, vt);
+      ty_env_set(env, s->as.let.name, vt, s->as.let.elem_type);
       last_type = vt;
     } else {
       last_type = type_check_expr(env, s);
@@ -1231,7 +1397,7 @@ static void type_check(Node *ast) {
     TyEnv env;
     ty_env_init(&env);
     for (Node *p = s->as.fn.params; p; p = p->next) {
-      ty_env_set(&env, p->as.variable.name, p->as.variable.type);
+      ty_env_set(&env, p->as.variable.name, p->as.variable.type, p->as.variable.elem_type);
     }
     TypeKind body_type = type_check_block(&env, s->as.fn.body);
     if (s->as.fn.ret_type != TYPE_VOID && body_type != s->as.fn.ret_type) {
@@ -1252,7 +1418,7 @@ static void type_check(Node *ast) {
           fprintf(stderr, "type error: let '%s' declared as %s but initializer is %s\n",
                   s->as.let.name, type_name(s->as.let.type), type_name(vt));
         }
-        ty_env_set(&env, s->as.let.name, vt);
+        ty_env_set(&env, s->as.let.name, vt, s->as.let.elem_type);
       } else if (s->type != NODE_FN) {
         type_check_expr(&env, s);
       }
