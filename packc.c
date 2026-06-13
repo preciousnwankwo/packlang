@@ -72,6 +72,7 @@ typedef enum {
   TOKEN_WHILE,
   TOKEN_FN,
   TOKEN_INT,
+  TOKEN_STR,
   TOKEN_ERROR,
 } TokenType;
 
@@ -126,6 +127,7 @@ static const char *token_name(TokenType t) {
     case TOKEN_WHILE:          return "WHILE";
     case TOKEN_FN:             return "FN";
     case TOKEN_INT:            return "INT";
+    case TOKEN_STR:            return "STR";
     case TOKEN_ERROR:          return "ERROR";
   }
   return "?";
@@ -215,6 +217,7 @@ static TokenType lexer_keyword(const char *start, int len) {
   if (len == 5 && memcmp(start, "while", 5) == 0) return TOKEN_WHILE;
   if (len == 2 && memcmp(start, "fn", 2) == 0) return TOKEN_FN;
   if (len == 3 && memcmp(start, "int", 3) == 0) return TOKEN_INT;
+  if (len == 3 && memcmp(start, "str", 3) == 0) return TOKEN_STR;
   return TOKEN_IDENTIFIER;
 }
 
@@ -296,11 +299,13 @@ static void token_print(Token t) {
 typedef enum {
   TYPE_VOID,
   TYPE_INT,
+  TYPE_STR,
 } TypeKind;
 
 static const char *type_name(TypeKind t) {
   switch (t) {
     case TYPE_INT: return "int";
+    case TYPE_STR: return "str";
     default:       return "void";
   }
 }
@@ -317,6 +322,7 @@ typedef enum {
   NODE_BLOCK,
   NODE_FN,
   NODE_CALL,
+  NODE_STRING,
 } NodeType;
 
 typedef struct Node {
@@ -324,6 +330,7 @@ typedef struct Node {
   struct Node *next;
   union {
     int number;
+    char *string;
     struct { char *name; TypeKind type; struct Node *value; } let;
     struct { char *name; TypeKind type; } variable;
     struct { struct Node *stmts; } program;
@@ -333,7 +340,7 @@ typedef struct Node {
     struct { char *name; TypeKind ret_type; struct Node *params; struct Node *body; } fn;
     struct { char *name; struct Node *args; } call;
     struct { TokenType op; struct Node *right; } unary;
-    struct { TokenType op; struct Node *left; struct Node *right; } binary;
+    struct { TokenType op; TypeKind type; struct Node *left; struct Node *right; } binary;
   } as;
 } Node;
 
@@ -380,11 +387,20 @@ static void codegen_expr(FILE *out, Node *n) {
       codegen_expr(out, n->as.unary.right);
       break;
     case NODE_BINARY:
-      fprintf(out, "(");
-      codegen_expr(out, n->as.binary.left);
-      fprintf(out, " %s ", op_to_c(n->as.binary.op));
-      codegen_expr(out, n->as.binary.right);
-      fprintf(out, ")");
+      if (n->as.binary.type == TYPE_STR) {
+        int t = temp_count++;
+        fprintf(out, "({char _s%d[256]; strcpy(_s%d, ", t, t);
+        codegen_expr(out, n->as.binary.left);
+        fprintf(out, "); strcat(_s%d, ", t);
+        codegen_expr(out, n->as.binary.right);
+        fprintf(out, "); _s%d; })", t);
+      } else {
+        fprintf(out, "(");
+        codegen_expr(out, n->as.binary.left);
+        fprintf(out, " %s ", op_to_c(n->as.binary.op));
+        codegen_expr(out, n->as.binary.right);
+        fprintf(out, ")");
+      }
       break;
     case NODE_IF: {
       int id = temp_count++;
@@ -432,6 +448,9 @@ static void codegen_expr(FILE *out, Node *n) {
       fprintf(out, " _t%d; })", id);
       break;
     }
+    case NODE_STRING:
+      fprintf(out, "\"%s\"", n->as.string);
+      break;
     case NODE_CALL:
       fprintf(out, "%s(", n->as.call.name);
       for (Node *a = n->as.call.args; a; a = a->next) {
@@ -489,7 +508,7 @@ static void codegen_block_expr(FILE *out, Node *n, int zero_if_empty) {
 static void codegen_stmt(FILE *out, Node *n) {
   switch (n->type) {
     case NODE_LET:
-      fprintf(out, "    int %s = ", n->as.let.name);
+      fprintf(out, "    %s %s = ", n->as.let.type == TYPE_STR ? "char*" : "int", n->as.let.name);
       codegen_expr(out, n->as.let.value);
       fprintf(out, ";\n");
       break;
@@ -510,11 +529,12 @@ static void codegen_stmt(FILE *out, Node *n) {
       fprintf(out, ";\n");
       break;
     case NODE_FN:
-      fprintf(out, "int %s(", n->as.fn.name);
+      fprintf(out, "%s %s(", n->as.fn.ret_type == TYPE_STR ? "char*" : "int", n->as.fn.name);
       Node *p;
       for (p = n->as.fn.params; p; p = p->next) {
         if (p != n->as.fn.params) fprintf(out, ", ");
-        fprintf(out, "int %s", p->as.variable.name);
+        const char *ct = p->as.variable.type == TYPE_STR ? "char*" : "int";
+        fprintf(out, "%s %s", ct, p->as.variable.name);
       }
       fprintf(out, ") {\n");
       codegen_block_stmts(out, n->as.fn.body);
@@ -523,22 +543,27 @@ static void codegen_stmt(FILE *out, Node *n) {
       fprintf(out, ";\n}\n");
       break;
     default:
+      fprintf(out, "    ");
+      codegen_expr(out, n);
+      fprintf(out, ";\n");
       break;
   }
 }
 
 static void codegen(FILE *out, Node *n) {
   if (n->type == NODE_PROGRAM) {
+    fprintf(out, "#include <string.h>\n");
     for (Node *s = n->as.program.stmts; s; s = s->next)
       if (s->type == NODE_FN) codegen_stmt(out, s);
     fprintf(out, "int main(void) {\n");
     Node *last = NULL;
     for (Node *s = n->as.program.stmts; s; s = s->next) {
       last = s;
-      if (s->type == NODE_LET)
+      if (s->type == NODE_LET) {
         codegen_stmt(out, s);
-      else if (s->type != NODE_FN && s->next)
+      } else if (s->type != NODE_FN && s->next) {
         codegen_stmt(out, s);
+      }
     }
     fprintf(out, "    return ");
     if (last && last->type != NODE_LET && last->type != NODE_FN)
@@ -618,6 +643,9 @@ static void node_print(FILE *out, Node *n) {
       fprintf(out, "(VAR %s", n->as.variable.name);
       if (n->as.variable.type) fprintf(out, " :%s", type_name(n->as.variable.type));
       fprintf(out, ")");
+      break;
+    case NODE_STRING:
+      fprintf(out, "\"%s\"", n->as.string);
       break;
     case NODE_NUMBER:
       fprintf(out, "%d", n->as.number);
@@ -710,7 +738,8 @@ static Node *parse_program(Parser *p) {
 
 static TypeKind parse_type(Parser *p) {
   if (parser_match(p, TOKEN_INT)) return TYPE_INT;
-  parser_error(p, "Expected type (int)");
+  if (parser_match(p, TOKEN_STR)) return TYPE_STR;
+  parser_error(p, "Expected type (int or str)");
   return TYPE_VOID;
 }
 
@@ -907,6 +936,14 @@ static Node *parse_factor(Parser *p) {
     n->as.number = atoi(p->previous.start);
     return n;
   }
+  if (parser_match(p, TOKEN_STRING)) {
+    Node *n = node_new(NODE_STRING);
+    int len = p->previous.length - 2;
+    n->as.string = malloc(len + 1);
+    memcpy(n->as.string, p->previous.start + 1, len);
+    n->as.string[len] = '\0';
+    return n;
+  }
   if (parser_match(p, TOKEN_IDENTIFIER)) {
     char *name = strdup_token(&p->previous);
     if (parser_match(p, TOKEN_LPAREN)) {
@@ -1042,6 +1079,8 @@ static TypeKind type_check_expr(TyEnv *env, Node *n) {
   switch (n->type) {
     case NODE_NUMBER:
       return TYPE_INT;
+    case NODE_STRING:
+      return TYPE_STR;
     case NODE_VARIABLE: {
       TypeKind t = ty_env_get(env, n->as.variable.name);
       if (t == TYPE_VOID) {
@@ -1063,12 +1102,25 @@ static TypeKind type_check_expr(TyEnv *env, Node *n) {
     case NODE_BINARY: {
       TypeKind lt = type_check_expr(env, n->as.binary.left);
       TypeKind rt = type_check_expr(env, n->as.binary.right);
-      if (lt != TYPE_INT || rt != TYPE_INT) {
-        type_errors++; 
-        fprintf(stderr, "type error: binary '%s' requires int operands, got %s and %s\n",
-                token_name(n->as.binary.op), type_name(lt), type_name(rt));
+      TypeKind result = TYPE_VOID;
+      if (n->as.binary.op == TOKEN_PLUS) {
+        if (lt == TYPE_STR && rt == TYPE_STR) result = TYPE_STR;
+        else if (lt == TYPE_INT && rt == TYPE_INT) result = TYPE_INT;
+        else {
+          type_errors++;
+          fprintf(stderr, "type error: '+' requires both int or both str, got %s and %s\n",
+                  type_name(lt), type_name(rt));
+        }
+      } else {
+        if (lt != TYPE_INT || rt != TYPE_INT) {
+          type_errors++;
+          fprintf(stderr, "type error: binary '%s' requires int operands, got %s and %s\n",
+                  token_name(n->as.binary.op), type_name(lt), type_name(rt));
+        }
+        result = TYPE_INT;
       }
-      return TYPE_INT;
+      n->as.binary.type = result;
+      return result;
     }
     case NODE_IF: {
       TypeKind ct = type_check_expr(env, n->as.iff.cond);

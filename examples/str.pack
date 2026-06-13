@@ -1,0 +1,5 @@
+fn greet(name: str) -> str {
+  "hello " + name
+};
+let s: str = greet("world");
+0
