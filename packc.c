@@ -373,8 +373,8 @@ typedef struct Node {
     struct { char *name; TypeKind type; TypeKind elem_type; char *struct_name; struct Node *value; } let;
     struct { char *name; TypeKind type; TypeKind elem_type; char *struct_name; } variable;
     struct { struct Node *stmts; } program;
-    struct { struct Node *stmts; } block;
-    struct { struct Node *cond; struct Node *then_block; struct Node *else_block; } iff;
+    struct { struct Node *stmts; TypeKind result_type; char *result_struct_name; } block;
+    struct { struct Node *cond; struct Node *then_block; struct Node *else_block; TypeKind result_type; char *result_struct_name; } iff;
     struct { struct Node *cond; struct Node *body; } whilee;
     struct { char *name; TypeKind ret_type; TypeKind ret_elem_type; char *ret_struct_name; struct Node *params; struct Node *body; } fn;
     struct { char *name; struct Node *args; char *ret_struct_name; } call;
@@ -420,6 +420,15 @@ static void codegen_block_all_stmts(FILE *out, Node *n);
 static void codegen_block_expr(FILE *out, Node *n, int zero_if_empty);
 static const char *let_struct_name(Node *s);
 
+static void codegen_c_type(FILE *out, TypeKind type, const char *struct_name) {
+  if (type == TYPE_STRUCT && struct_name)
+    fprintf(out, "struct %s", struct_name);
+  else if (type == TYPE_STR)
+    fprintf(out, "char*");
+  else
+    fprintf(out, "int");
+}
+
 static void codegen_expr(FILE *out, Node *n) {
   switch (n->type) {
     case NODE_NUMBER:
@@ -450,7 +459,9 @@ static void codegen_expr(FILE *out, Node *n) {
       break;
     case NODE_IF: {
       int id = temp_count++;
-      fprintf(out, "({int _t%d; if (", id);
+      fprintf(out, "({");
+      codegen_c_type(out, n->as.iff.result_type, n->as.iff.result_struct_name);
+      fprintf(out, " _t%d; if (", id);
       codegen_expr(out, n->as.iff.cond);
       fprintf(out, ") {");
       codegen_block_stmts(out, n->as.iff.then_block);
@@ -465,13 +476,17 @@ static void codegen_expr(FILE *out, Node *n) {
     }
     case NODE_BLOCK: {
       int id = temp_count++;
-      fprintf(out, "({int _t%d; ", id);
+      fprintf(out, "({");
+      codegen_c_type(out, n->as.block.result_type, n->as.block.result_struct_name);
+      fprintf(out, " _t%d; ", id);
       Node *s;
       for (s = n->as.block.stmts; s && s->next; s = s->next) {
         if (s->type == NODE_LET) {
           const char *lsn = let_struct_name(s);
           if (lsn) {
             fprintf(out, "struct %s %s = ", lsn, s->as.let.name);
+          } else if (s->as.let.type == TYPE_STR) {
+            fprintf(out, "char* %s = ", s->as.let.name);
           } else {
             fprintf(out, "int %s = ", s->as.let.name);
           }
@@ -487,6 +502,8 @@ static void codegen_expr(FILE *out, Node *n) {
           const char *lsn = let_struct_name(s);
           if (lsn) {
             fprintf(out, "struct %s %s = ", lsn, s->as.let.name);
+          } else if (s->as.let.type == TYPE_STR) {
+            fprintf(out, "char* %s = ", s->as.let.name);
           } else {
             fprintf(out, "int %s = ", s->as.let.name);
           }
@@ -574,13 +591,13 @@ static void codegen_block_stmts(FILE *out, Node *n) {
       const char *lsn = let_struct_name(s);
       if (lsn) {
         fprintf(out, " struct %s %s = ", lsn, s->as.let.name);
-        codegen_expr(out, s->as.let.value);
-        fprintf(out, ";");
+      } else if (s->as.let.type == TYPE_STR) {
+        fprintf(out, " char* %s = ", s->as.let.name);
       } else {
         fprintf(out, " int %s = ", s->as.let.name);
-        codegen_expr(out, s->as.let.value);
-        fprintf(out, ";");
       }
+      codegen_expr(out, s->as.let.value);
+      fprintf(out, ";");
     }
   }
 }
@@ -591,6 +608,10 @@ static void codegen_block_all_stmts(FILE *out, Node *n) {
       const char *lsn = let_struct_name(s);
       if (lsn) {
         fprintf(out, " struct %s %s = ", lsn, s->as.let.name);
+        codegen_expr(out, s->as.let.value);
+        fprintf(out, ";");
+      } else if (s->as.let.type == TYPE_STR) {
+        fprintf(out, " char* %s = ", s->as.let.name);
         codegen_expr(out, s->as.let.value);
         fprintf(out, ";");
       } else {
@@ -1596,6 +1617,11 @@ static TypeKind type_check_expr(TyEnv *env, Node *n) {
         fprintf(stderr, "type error: if branches must have same type, got %s and %s\n",
                 type_name(tt), type_name(et));
       }
+      n->as.iff.result_type = tt;
+      if (tt == TYPE_STRUCT) {
+        const char *sn = n->as.iff.then_block->as.block.result_struct_name;
+        if (sn) n->as.iff.result_struct_name = strdup_str(sn);
+      }
       return tt;
     }
     case NODE_WHILE: {
@@ -1682,6 +1708,18 @@ static TypeKind type_check_expr(TyEnv *env, Node *n) {
   }
 }
 
+static const char *node_struct_name(TyEnv *env, Node *n) {
+  if (!n) return NULL;
+  if (n->type == NODE_VARIABLE) return ty_env_get_struct_name(env, n->as.variable.name);
+  if (n->type == NODE_STRUCT_LITERAL) return n->as.struct_lit.struct_name;
+  if (n->type == NODE_CALL) return n->as.call.ret_struct_name;
+  if (n->type == NODE_FIELD_ACCESS) return node_struct_name(env, n->as.field_access.record);
+  if (n->type == NODE_LET) return node_struct_name(env, n->as.let.value);
+  if (n->type == NODE_BLOCK) return n->as.block.result_struct_name;
+  if (n->type == NODE_IF) return n->as.iff.result_struct_name;
+  return NULL;
+}
+
 static TypeKind type_check_block(TyEnv *env, Node *n) {
   if (!n || n->type != NODE_BLOCK) return TYPE_VOID;
   TypeKind last_type = TYPE_VOID;
@@ -1693,19 +1731,31 @@ static TypeKind type_check_block(TyEnv *env, Node *n) {
         fprintf(stderr, "type error: let '%s' declared as %s but initializer is %s\n",
                 s->as.let.name, type_name(s->as.let.type), type_name(vt));
       }
-      const char *let_sn = s->as.let.struct_name;
-      if (vt == TYPE_STRUCT && !let_sn && s->as.let.value) {
-        if (s->as.let.value->type == NODE_STRUCT_LITERAL)
-          let_sn = s->as.let.value->as.struct_lit.struct_name;
-        else if (s->as.let.value->type == NODE_CALL)
-          let_sn = s->as.let.value->as.call.ret_struct_name;
-        else if (s->as.let.value->type == NODE_VARIABLE)
-          let_sn = ty_env_get_struct_name(env, s->as.let.value->as.variable.name);
+      if (s->as.let.type == TYPE_VOID) {
+        s->as.let.type = vt;
+        if (vt == TYPE_STRUCT) {
+          const char *sn = s->as.let.struct_name;
+          if (!sn) sn = node_struct_name(env, s->as.let.value);
+          if (sn) s->as.let.struct_name = strdup_str(sn);
+        }
       }
+      const char *let_sn = s->as.let.struct_name;
+      if (vt == TYPE_STRUCT && !let_sn && s->as.let.value)
+        let_sn = node_struct_name(env, s->as.let.value);
       ty_env_set(env, s->as.let.name, vt, s->as.let.elem_type, let_sn);
       last_type = vt;
     } else {
       last_type = type_check_expr(env, s);
+    }
+  }
+  n->as.block.result_type = last_type;
+  if (last_type == TYPE_STRUCT) {
+    Node *last = n->as.block.stmts;
+    if (last) {
+      while (last->next) last = last->next;
+      if (last->type == NODE_LET) last = last->as.let.value;
+      const char *sn = node_struct_name(env, last);
+      if (sn) n->as.block.result_struct_name = strdup_str(sn);
     }
   }
   return last_type;
@@ -1756,15 +1806,17 @@ static void type_check(Node *ast) {
           fprintf(stderr, "type error: let '%s' declared as %s but initializer is %s\n",
                   s->as.let.name, type_name(s->as.let.type), type_name(vt));
         }
-        const char *let_sn2 = s->as.let.struct_name;
-        if (vt == TYPE_STRUCT && !let_sn2 && s->as.let.value) {
-          if (s->as.let.value->type == NODE_STRUCT_LITERAL)
-            let_sn2 = s->as.let.value->as.struct_lit.struct_name;
-          else if (s->as.let.value->type == NODE_CALL)
-            let_sn2 = s->as.let.value->as.call.ret_struct_name;
-          else if (s->as.let.value->type == NODE_VARIABLE)
-            let_sn2 = ty_env_get_struct_name(&env, s->as.let.value->as.variable.name);
+        if (s->as.let.type == TYPE_VOID) {
+          s->as.let.type = vt;
+          if (vt == TYPE_STRUCT) {
+            const char *sn = s->as.let.struct_name;
+            if (!sn) sn = node_struct_name(&env, s->as.let.value);
+            if (sn) s->as.let.struct_name = strdup_str(sn);
+          }
         }
+        const char *let_sn2 = s->as.let.struct_name;
+        if (vt == TYPE_STRUCT && !let_sn2 && s->as.let.value)
+          let_sn2 = node_struct_name(&env, s->as.let.value);
         ty_env_set(&env, s->as.let.name, vt, s->as.let.elem_type, let_sn2);
       } else if (s->type != NODE_FN) {
         type_check_expr(&env, s);
