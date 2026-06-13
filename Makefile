@@ -25,3 +25,7 @@ test: packc
 	/tmp/packtest; echo "exit: $$?"
 	./packc --emit-c examples/arr.pack | gcc -x c - -o /tmp/packtest 2>/dev/null
 	/tmp/packtest; echo "exit: $$?"
+	./packc --emit-c examples/struct.pack | gcc -x c - -o /tmp/packtest 2>/dev/null
+	/tmp/packtest; echo "exit: $$?"
+	./packc --emit-c examples/struct_fn.pack | gcc -x c - -o /tmp/packtest 2>/dev/null
+	/tmp/packtest; echo "exit: $$?"

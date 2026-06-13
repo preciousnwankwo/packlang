@@ -1,0 +1,6 @@
+struct Point { x: int, y: int }
+fn make_point(x: int, y: int) -> Point {
+  Point { x: x, y: y }
+}
+let p = make_point(3, 4);
+p.x + p.y

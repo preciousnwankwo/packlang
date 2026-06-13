@@ -75,6 +75,7 @@ typedef enum {
   TOKEN_FN,
   TOKEN_INT,
   TOKEN_STR,
+  TOKEN_STRUCT,
   TOKEN_ERROR,
 } TokenType;
 
@@ -132,6 +133,7 @@ static const char *token_name(TokenType t) {
     case TOKEN_FN:             return "FN";
     case TOKEN_INT:            return "INT";
     case TOKEN_STR:            return "STR";
+    case TOKEN_STRUCT:         return "STRUCT";
     case TOKEN_ERROR:          return "ERROR";
   }
   return "?";
@@ -222,6 +224,7 @@ static TokenType lexer_keyword(const char *start, int len) {
   if (len == 2 && memcmp(start, "fn", 2) == 0) return TOKEN_FN;
   if (len == 3 && memcmp(start, "int", 3) == 0) return TOKEN_INT;
   if (len == 3 && memcmp(start, "str", 3) == 0) return TOKEN_STR;
+  if (len == 6 && memcmp(start, "struct", 6) == 0) return TOKEN_STRUCT;
   return TOKEN_IDENTIFIER;
 }
 
@@ -307,6 +310,7 @@ typedef enum {
   TYPE_INT,
   TYPE_STR,
   TYPE_ARRAY,
+  TYPE_STRUCT,
 } TypeKind;
 
 static const char *type_name(TypeKind t) {
@@ -314,8 +318,29 @@ static const char *type_name(TypeKind t) {
     case TYPE_INT:   return "int";
     case TYPE_STR:   return "str";
     case TYPE_ARRAY: return "array";
+    case TYPE_STRUCT: return "struct";
     default:         return "void";
   }
+}
+
+#define MAX_FIELDS 64
+#define MAX_STRUCTS 64
+
+typedef struct {
+  char *name;
+  char *field_names[MAX_FIELDS];
+  TypeKind field_types[MAX_FIELDS];
+  TypeKind field_elem_types[MAX_FIELDS];
+  int field_count;
+} StructInfo;
+
+static StructInfo structs[MAX_STRUCTS];
+static int struct_count = 0;
+
+static StructInfo *find_struct(const char *name) {
+  for (int i = 0; i < struct_count; i++)
+    if (strcmp(structs[i].name, name) == 0) return &structs[i];
+  return NULL;
 }
 
 typedef enum {
@@ -333,6 +358,10 @@ typedef enum {
   NODE_STRING,
   NODE_ARRAY,
   NODE_INDEX,
+  NODE_STRUCT_DEF,
+  NODE_STRUCT_LITERAL,
+  NODE_FIELD_INIT,
+  NODE_FIELD_ACCESS,
 } NodeType;
 
 typedef struct Node {
@@ -341,18 +370,22 @@ typedef struct Node {
   union {
     int number;
     char *string;
-    struct { char *name; TypeKind type; TypeKind elem_type; struct Node *value; } let;
-    struct { char *name; TypeKind type; TypeKind elem_type; } variable;
+    struct { char *name; TypeKind type; TypeKind elem_type; char *struct_name; struct Node *value; } let;
+    struct { char *name; TypeKind type; TypeKind elem_type; char *struct_name; } variable;
     struct { struct Node *stmts; } program;
     struct { struct Node *stmts; } block;
     struct { struct Node *cond; struct Node *then_block; struct Node *else_block; } iff;
     struct { struct Node *cond; struct Node *body; } whilee;
-    struct { char *name; TypeKind ret_type; TypeKind ret_elem_type; struct Node *params; struct Node *body; } fn;
-    struct { char *name; struct Node *args; } call;
+    struct { char *name; TypeKind ret_type; TypeKind ret_elem_type; char *ret_struct_name; struct Node *params; struct Node *body; } fn;
+    struct { char *name; struct Node *args; char *ret_struct_name; } call;
     struct { TypeKind elem_type; struct Node *elements; } array;
     struct { struct Node *array; struct Node *index; TypeKind elem_type; } indexx;
     struct { TokenType op; struct Node *right; } unary;
     struct { TokenType op; TypeKind type; struct Node *left; struct Node *right; } binary;
+    struct { char *name; struct Node *fields; } struct_def;
+    struct { char *struct_name; struct Node *fields; } struct_lit;
+    struct { char *field_name; struct Node *value; } field_init;
+    struct { struct Node *record; char *field_name; } field_access;
   } as;
 } Node;
 
@@ -385,6 +418,7 @@ static void codegen_expr(FILE *out, Node *n);
 static void codegen_block_stmts(FILE *out, Node *n);
 static void codegen_block_all_stmts(FILE *out, Node *n);
 static void codegen_block_expr(FILE *out, Node *n, int zero_if_empty);
+static const char *let_struct_name(Node *s);
 
 static void codegen_expr(FILE *out, Node *n) {
   switch (n->type) {
@@ -435,7 +469,12 @@ static void codegen_expr(FILE *out, Node *n) {
       Node *s;
       for (s = n->as.block.stmts; s && s->next; s = s->next) {
         if (s->type == NODE_LET) {
-          fprintf(out, "int %s = ", s->as.let.name);
+          const char *lsn = let_struct_name(s);
+          if (lsn) {
+            fprintf(out, "struct %s %s = ", lsn, s->as.let.name);
+          } else {
+            fprintf(out, "int %s = ", s->as.let.name);
+          }
           codegen_expr(out, s->as.let.value);
           fprintf(out, "; ");
         } else {
@@ -445,7 +484,12 @@ static void codegen_expr(FILE *out, Node *n) {
       }
       if (s) {
         if (s->type == NODE_LET) {
-          fprintf(out, "int %s = ", s->as.let.name);
+          const char *lsn = let_struct_name(s);
+          if (lsn) {
+            fprintf(out, "struct %s %s = ", lsn, s->as.let.name);
+          } else {
+            fprintf(out, "int %s = ", s->as.let.name);
+          }
           codegen_expr(out, s->as.let.value);
           fprintf(out, "; _t%d = ", id);
           codegen_expr(out, s->as.let.value);
@@ -494,17 +538,49 @@ static void codegen_expr(FILE *out, Node *n) {
       codegen_block_all_stmts(out, n->as.whilee.body);
       fprintf(out, " } 0; })");
       break;
+    case NODE_STRUCT_LITERAL: {
+      fprintf(out, "((struct %s){", n->as.struct_lit.struct_name);
+      for (Node *f = n->as.struct_lit.fields; f; f = f->next) {
+        if (f != n->as.struct_lit.fields) fprintf(out, ", ");
+        fprintf(out, ".%s = ", f->as.field_init.field_name);
+        codegen_expr(out, f->as.field_init.value);
+      }
+      fprintf(out, "})");
+      break;
+    }
+    case NODE_FIELD_ACCESS:
+      fprintf(out, "(");
+      codegen_expr(out, n->as.field_access.record);
+      fprintf(out, ").%s", n->as.field_access.field_name);
+      break;
     default:
       break;
   }
 }
 
+static const char *let_struct_name(Node *s) {
+  if (s->as.let.struct_name) return s->as.let.struct_name;
+  if (!s->as.let.value) return NULL;
+  if (s->as.let.value->type == NODE_STRUCT_LITERAL)
+    return s->as.let.value->as.struct_lit.struct_name;
+  if (s->as.let.value->type == NODE_CALL)
+    return s->as.let.value->as.call.ret_struct_name;
+  return NULL;
+}
+
 static void codegen_block_stmts(FILE *out, Node *n) {
   for (Node *s = n->as.block.stmts; s; s = s->next) {
     if (s->type == NODE_LET) {
-      fprintf(out, " int %s = ", s->as.let.name);
-      codegen_expr(out, s->as.let.value);
-      fprintf(out, ";");
+      const char *lsn = let_struct_name(s);
+      if (lsn) {
+        fprintf(out, " struct %s %s = ", lsn, s->as.let.name);
+        codegen_expr(out, s->as.let.value);
+        fprintf(out, ";");
+      } else {
+        fprintf(out, " int %s = ", s->as.let.name);
+        codegen_expr(out, s->as.let.value);
+        fprintf(out, ";");
+      }
     }
   }
 }
@@ -512,9 +588,16 @@ static void codegen_block_stmts(FILE *out, Node *n) {
 static void codegen_block_all_stmts(FILE *out, Node *n) {
   for (Node *s = n->as.block.stmts; s; s = s->next) {
     if (s->type == NODE_LET) {
-      fprintf(out, " int %s = ", s->as.let.name);
-      codegen_expr(out, s->as.let.value);
-      fprintf(out, ";");
+      const char *lsn = let_struct_name(s);
+      if (lsn) {
+        fprintf(out, " struct %s %s = ", lsn, s->as.let.name);
+        codegen_expr(out, s->as.let.value);
+        fprintf(out, ";");
+      } else {
+        fprintf(out, " int %s = ", s->as.let.name);
+        codegen_expr(out, s->as.let.value);
+        fprintf(out, ";");
+      }
     } else {
       fprintf(out, " ");
       codegen_expr(out, s);
@@ -545,6 +628,19 @@ static void codegen_stmt(FILE *out, Node *n) {
         fprintf(out, "    %s %s[%d] = ", ct, n->as.let.name, count);
         codegen_expr(out, n->as.let.value);
         fprintf(out, ";\n");
+      } else if ((n->as.let.type == TYPE_STRUCT && n->as.let.struct_name) ||
+                 (n->as.let.type != TYPE_STRUCT && n->as.let.value && n->as.let.value->type == NODE_STRUCT_LITERAL) ||
+                 (n->as.let.type != TYPE_STRUCT && n->as.let.value && n->as.let.value->type == NODE_CALL && n->as.let.value->as.call.ret_struct_name)) {
+        const char *sn = n->as.let.struct_name;
+        if (!sn && n->as.let.value) {
+          if (n->as.let.value->type == NODE_STRUCT_LITERAL)
+            sn = n->as.let.value->as.struct_lit.struct_name;
+          else if (n->as.let.value->type == NODE_CALL)
+            sn = n->as.let.value->as.call.ret_struct_name;
+        }
+        fprintf(out, "    struct %s %s = ", sn ? sn : "?", n->as.let.name);
+        codegen_expr(out, n->as.let.value);
+        fprintf(out, ";\n");
       } else {
         fprintf(out, "    %s %s = ", n->as.let.type == TYPE_STR ? "char*" : "int", n->as.let.name);
         codegen_expr(out, n->as.let.value);
@@ -569,13 +665,15 @@ static void codegen_stmt(FILE *out, Node *n) {
       break;
     case NODE_FN:
       fprintf(out, "%s %s(",
+              n->as.fn.ret_type == TYPE_STRUCT ? (n->as.fn.ret_struct_name ? n->as.fn.ret_struct_name : "int") :
               n->as.fn.ret_type == TYPE_STR ? "char*" :
               n->as.fn.ret_type == TYPE_ARRAY ? "int*" : "int",
               n->as.fn.name);
       Node *p;
       for (p = n->as.fn.params; p; p = p->next) {
         if (p != n->as.fn.params) fprintf(out, ", ");
-        const char *ct = p->as.variable.type == TYPE_STR ? "char*" :
+        const char *ct = p->as.variable.type == TYPE_STRUCT ? (p->as.variable.struct_name ? p->as.variable.struct_name : "int") :
+                         p->as.variable.type == TYPE_STR ? "char*" :
                          p->as.variable.type == TYPE_ARRAY ? "int" : "int";
         fprintf(out, "%s %s", ct, p->as.variable.name);
         if (p->as.variable.type == TYPE_ARRAY) fprintf(out, "[]");
@@ -586,6 +684,17 @@ static void codegen_stmt(FILE *out, Node *n) {
       codegen_block_expr(out, n->as.fn.body, 1);
       fprintf(out, ";\n}\n");
       break;
+    case NODE_STRUCT_DEF: {
+      fprintf(out, "typedef struct %s {", n->as.struct_def.name);
+      for (Node *f = n->as.struct_def.fields; f; f = f->next) {
+        const char *ft = f->as.variable.type == TYPE_STR ? "char*" :
+                         f->as.variable.type == TYPE_ARRAY ? "int" : "int";
+        fprintf(out, " %s %s;", ft, f->as.variable.name);
+        if (f->as.variable.type == TYPE_ARRAY) fprintf(out, "[100]");
+      }
+      fprintf(out, " } %s;\n", n->as.struct_def.name);
+      break;
+    }
     default:
       fprintf(out, "    ");
       codegen_expr(out, n);
@@ -598,6 +707,8 @@ static void codegen(FILE *out, Node *n) {
   if (n->type == NODE_PROGRAM) {
     fprintf(out, "#include <string.h>\n");
     for (Node *s = n->as.program.stmts; s; s = s->next)
+      if (s->type == NODE_STRUCT_DEF) codegen_stmt(out, s);
+    for (Node *s = n->as.program.stmts; s; s = s->next)
       if (s->type == NODE_FN) codegen_stmt(out, s);
     fprintf(out, "int main(void) {\n");
     Node *last = NULL;
@@ -605,7 +716,7 @@ static void codegen(FILE *out, Node *n) {
       last = s;
       if (s->type == NODE_LET) {
         codegen_stmt(out, s);
-      } else if (s->type != NODE_FN && s->next) {
+      } else if (s->type != NODE_FN && s->type != NODE_STRUCT_DEF && s->next) {
         codegen_stmt(out, s);
       }
     }
@@ -732,6 +843,31 @@ static void node_print(FILE *out, Node *n) {
       node_print(out, n->as.binary.right);
       fprintf(out, ")");
       break;
+    case NODE_STRUCT_DEF:
+      fprintf(out, "(STRUCT %s", n->as.struct_def.name);
+      for (Node *f = n->as.struct_def.fields; f; f = f->next)
+        fprintf(out, " (%s :%s)", f->as.variable.name, type_name(f->as.variable.type));
+      fprintf(out, ")");
+      break;
+    case NODE_STRUCT_LITERAL:
+      fprintf(out, "(%s", n->as.struct_lit.struct_name);
+      for (Node *f = n->as.struct_lit.fields; f; f = f->next) {
+        fprintf(out, " (%s ", f->as.field_init.field_name);
+        node_print(out, f->as.field_init.value);
+        fprintf(out, ")");
+      }
+      fprintf(out, ")");
+      break;
+    case NODE_FIELD_ACCESS:
+      fprintf(out, "(. ");
+      node_print(out, n->as.field_access.record);
+      fprintf(out, " %s)", n->as.field_access.field_name);
+      break;
+    case NODE_FIELD_INIT:
+      fprintf(out, "(FIELD-INIT %s ", n->as.field_init.field_name);
+      node_print(out, n->as.field_init.value);
+      fprintf(out, ")");
+      break;
   }
 }
 
@@ -806,23 +942,39 @@ static Node *parse_program(Parser *p) {
   return prog;
 }
 
-static TypeKind parse_type(Parser *p, TypeKind *elem_type) {
+static TypeKind parse_type(Parser *p, TypeKind *elem_type, char **struct_name) {
   if (parser_match(p, TOKEN_INT)) return TYPE_INT;
   if (parser_match(p, TOKEN_STR)) return TYPE_STR;
   if (parser_match(p, TOKEN_LBRACKET)) {
-    TypeKind et = parse_type(p, NULL);
+    TypeKind et = parse_type(p, NULL, NULL);
     if (!parser_match(p, TOKEN_RBRACKET))
       parser_error(p, "Expected ']'");
     if (elem_type) *elem_type = et;
     return TYPE_ARRAY;
   }
-  parser_error(p, "Expected type (int, str, or [type])");
+  if (parser_check(p, TOKEN_IDENTIFIER)) {
+    char *name = strdup_token(&p->current);
+    if (find_struct(name)) {
+      parser_advance(p);
+      if (struct_name) *struct_name = name;
+      else free(name);
+      return TYPE_STRUCT;
+    }
+    free(name);
+  }
+  parser_error(p, "Expected type (int, str, [type], or struct name)");
   return TYPE_VOID;
 }
 
 static Node *parse_fn(Parser *p);
+static Node *parse_struct_def(Parser *p);
 
 static Node *parse_statement(Parser *p) {
+  if (parser_match(p, TOKEN_STRUCT)) {
+    Node *n = parse_struct_def(p);
+    if (n) parser_match(p, TOKEN_SEMICOLON);
+    return n;
+  }
   if (parser_match(p, TOKEN_FN)) {
     Node *n = parse_fn(p);
     if (n) parser_match(p, TOKEN_SEMICOLON);
@@ -845,10 +997,11 @@ static Node *parse_statement(Parser *p) {
     }
     Node *n = node_new(NODE_LET);
     n->as.let.name = name;
-    n->as.let.type = TYPE_INT;
+    n->as.let.type = TYPE_VOID;
     n->as.let.elem_type = TYPE_VOID;
+    n->as.let.struct_name = NULL;
     if (parser_match(p, TOKEN_COLON))
-      n->as.let.type = parse_type(p, &n->as.let.elem_type);
+      n->as.let.type = parse_type(p, &n->as.let.elem_type, &n->as.let.struct_name);
     if (!parser_match(p, TOKEN_EQUAL)) {
       parser_error(p, "Expected '='");
       return NULL;
@@ -901,12 +1054,14 @@ static Node *parse_fn(Parser *p) {
       }
       TypeKind pt = TYPE_INT;
       TypeKind pet = TYPE_VOID;
+      char *pstruct_name = NULL;
       if (parser_match(p, TOKEN_COLON))
-        pt = parse_type(p, &pet);
+        pt = parse_type(p, &pet, &pstruct_name);
       Node *pn = node_new(NODE_VARIABLE);
       pn->as.variable.name = pname;
       pn->as.variable.type = pt;
       pn->as.variable.elem_type = pet;
+      pn->as.variable.struct_name = pstruct_name;
       if (!params_head) params_head = pn;
       else params_tail->next = pn;
       params_tail = pn;
@@ -919,16 +1074,91 @@ static Node *parse_fn(Parser *p) {
   }
   TypeKind ret_type = TYPE_INT;
   TypeKind ret_elem_type = TYPE_VOID;
+  char *ret_struct_name = NULL;
   if (parser_match(p, TOKEN_ARROW))
-    ret_type = parse_type(p, &ret_elem_type);
+    ret_type = parse_type(p, &ret_elem_type, &ret_struct_name);
   Node *body = parse_block(p);
   sym_pop(&p->sym);
   Node *n = node_new(NODE_FN);
   n->as.fn.name = name;
   n->as.fn.ret_type = ret_type;
   n->as.fn.ret_elem_type = ret_elem_type;
+  n->as.fn.ret_struct_name = ret_struct_name;
   n->as.fn.params = params_head;
   n->as.fn.body = body;
+  return n;
+}
+
+static Node *parse_struct_def(Parser *p) {
+  if (!parser_check(p, TOKEN_IDENTIFIER)) {
+    parser_error(p, "Expected struct name");
+    return NULL;
+  }
+  char *name = strdup_token(&p->current);
+  parser_advance(p);
+  if (!parser_match(p, TOKEN_LBRACE)) {
+    parser_error(p, "Expected '{'");
+    free(name);
+    return NULL;
+  }
+  Node *fields_head = NULL, *fields_tail = NULL;
+  if (!parser_check(p, TOKEN_RBRACE)) {
+    do {
+      if (!parser_check(p, TOKEN_IDENTIFIER)) {
+        parser_error(p, "Expected field name");
+        free(name);
+        return NULL;
+      }
+      char *fname = strdup_token(&p->current);
+      parser_advance(p);
+      TypeKind elem_type = TYPE_VOID;
+      TypeKind ftype = TYPE_INT;
+      if (!parser_match(p, TOKEN_COLON)) {
+        parser_error(p, "Expected ':'");
+        free(name); free(fname);
+        return NULL;
+      }
+      ftype = parse_type(p, &elem_type, NULL);
+      Node *fn = node_new(NODE_VARIABLE);
+      fn->as.variable.name = fname;
+      fn->as.variable.type = ftype;
+      fn->as.variable.elem_type = elem_type;
+      fn->as.variable.struct_name = NULL;
+      if (!fields_head) fields_head = fn;
+      else fields_tail->next = fn;
+      fields_tail = fn;
+    } while (parser_match(p, TOKEN_COMMA));
+  }
+  if (!parser_match(p, TOKEN_RBRACE)) {
+    parser_error(p, "Expected '}'");
+    free(name);
+    return NULL;
+  }
+  // Register struct
+  if (find_struct(name)) {
+    fprintf(stderr, "error:%d:%d: Duplicate struct '%s'\n",
+            p->previous.line, p->previous.column, name);
+    p->panic = 1;
+    free(name);
+    return NULL;
+  }
+  if (struct_count >= MAX_STRUCTS) {
+    parser_error(p, "Too many structs");
+    free(name);
+    return NULL;
+  }
+  StructInfo *si = &structs[struct_count++];
+  si->name = name;
+  si->field_count = 0;
+  for (Node *f = fields_head; f; f = f->next) {
+    si->field_names[si->field_count] = f->as.variable.name;
+    si->field_types[si->field_count] = f->as.variable.type;
+    si->field_elem_types[si->field_count] = f->as.variable.elem_type;
+    si->field_count++;
+  }
+  Node *n = node_new(NODE_STRUCT_DEF);
+  n->as.struct_def.name = name;
+  n->as.struct_def.fields = fields_head;
   return n;
 }
 
@@ -980,14 +1210,29 @@ static Node *parse_term(Parser *p) {
 
 static Node *parse_index(Parser *p) {
   Node *n = parse_factor(p);
-  while (parser_match(p, TOKEN_LBRACKET)) {
-    Node *idx = parse_expr(p);
-    if (!parser_match(p, TOKEN_RBRACKET))
-      parser_error(p, "Expected ']'");
-    Node *in = node_new(NODE_INDEX);
-    in->as.indexx.array = n;
-    in->as.indexx.index = idx;
-    n = in;
+  for (;;) {
+    if (parser_match(p, TOKEN_LBRACKET)) {
+      Node *idx = parse_expr(p);
+      if (!parser_match(p, TOKEN_RBRACKET))
+        parser_error(p, "Expected ']'");
+      Node *in = node_new(NODE_INDEX);
+      in->as.indexx.array = n;
+      in->as.indexx.index = idx;
+      n = in;
+    } else if (parser_match(p, TOKEN_DOT)) {
+      if (!parser_check(p, TOKEN_IDENTIFIER)) {
+        parser_error(p, "Expected field name");
+        return n;
+      }
+      char *fname = strdup_token(&p->current);
+      parser_advance(p);
+      Node *fa = node_new(NODE_FIELD_ACCESS);
+      fa->as.field_access.record = n;
+      fa->as.field_access.field_name = fname;
+      n = fa;
+    } else {
+      break;
+    }
   }
   return n;
 }
@@ -1012,8 +1257,6 @@ static Node *parse_factor(Parser *p) {
     n->as.array.elements = head;
     return n;
   }
-  if (parser_match(p, TOKEN_LBRACE))
-    return parse_block_body(p);
   if (parser_match(p, TOKEN_LBRACE))
     return parse_block_body(p);
   if (parser_match(p, TOKEN_WHILE)) {
@@ -1081,6 +1324,43 @@ static Node *parse_factor(Parser *p) {
       n->as.call.args = args_head;
       return n;
     }
+    if (find_struct(name) && parser_check(p, TOKEN_LBRACE)) {
+      parser_advance(p);
+      Node *fields_head = NULL, *fields_tail = NULL;
+      if (!parser_check(p, TOKEN_RBRACE)) {
+        do {
+          if (!parser_check(p, TOKEN_IDENTIFIER)) {
+            parser_error(p, "Expected field name");
+            free(name);
+            return NULL;
+          }
+          char *fname = strdup_token(&p->current);
+          parser_advance(p);
+          if (!parser_match(p, TOKEN_COLON)) {
+            parser_error(p, "Expected ':'");
+            free(name); free(fname);
+            return NULL;
+          }
+          Node *fv = parse_expr(p);
+          if (!fv || p->panic) { free(name); free(fname); return NULL; }
+          Node *fi = node_new(NODE_FIELD_INIT);
+          fi->as.field_init.field_name = fname;
+          fi->as.field_init.value = fv;
+          if (!fields_head) fields_head = fi;
+          else fields_tail->next = fi;
+          fields_tail = fi;
+        } while (parser_match(p, TOKEN_COMMA));
+      }
+      if (!parser_match(p, TOKEN_RBRACE)) {
+        parser_error(p, "Expected '}'");
+        free(name);
+        return NULL;
+      }
+      Node *lit = node_new(NODE_STRUCT_LITERAL);
+      lit->as.struct_lit.struct_name = name;
+      lit->as.struct_lit.fields = fields_head;
+      return lit;
+    }
     if (!sym_lookup(&p->sym, name)) {
       fprintf(stderr, "error:%d:%d: Undefined variable '%s'\n",
               p->previous.line, p->previous.column, name);
@@ -1145,7 +1425,7 @@ static char *read_file(const char *path) {
 
 // --- Type Checker ---
 
-typedef struct { char *name; TypeKind type; TypeKind elem_type; } TyEntry;
+typedef struct { char *name; TypeKind type; TypeKind elem_type; char *struct_name; } TyEntry;
 typedef struct { TyEntry entries[MAX_VARS_PER_SCOPE]; int count; } TyScope;
 typedef struct {
   TyScope scopes[MAX_SCOPE];
@@ -1155,7 +1435,9 @@ typedef struct {
 typedef struct {
   char *name;
   TypeKind ret_type;
+  char *ret_struct_name;
   TypeKind param_types[MAX_VARS_PER_SCOPE];
+  char *param_struct_names[MAX_VARS_PER_SCOPE];
   int param_count;
 } FnSig;
 
@@ -1166,11 +1448,12 @@ static void ty_env_init(TyEnv *env) { env->depth = 0; env->scopes[0].count = 0; 
 static void ty_env_push(TyEnv *env) { env->depth++; env->scopes[env->depth].count = 0; }
 static void ty_env_pop(TyEnv *env) { env->depth--; }
 
-static void ty_env_set(TyEnv *env, const char *name, TypeKind t, TypeKind elem) {
+static void ty_env_set(TyEnv *env, const char *name, TypeKind t, TypeKind elem, const char *struct_name) {
   TyScope *s = &env->scopes[env->depth];
   s->entries[s->count].name = strdup_str(name);
   s->entries[s->count].type = t;
   s->entries[s->count].elem_type = elem;
+  s->entries[s->count].struct_name = struct_name ? strdup_str(struct_name) : NULL;
   s->count++;
 }
 
@@ -1188,6 +1471,14 @@ static TypeKind ty_env_get_elem(TyEnv *env, const char *name) {
       if (strcmp(env->scopes[d].entries[i].name, name) == 0)
         return env->scopes[d].entries[i].elem_type;
   return TYPE_VOID;
+}
+
+static const char *ty_env_get_struct_name(TyEnv *env, const char *name) {
+  for (int d = env->depth; d >= 0; d--)
+    for (int i = 0; i < env->scopes[d].count; i++)
+      if (strcmp(env->scopes[d].entries[i].name, name) == 0)
+        return env->scopes[d].entries[i].struct_name;
+  return NULL;
 }
 
 static int type_errors = 0;
@@ -1346,7 +1637,42 @@ static TypeKind type_check_expr(TyEnv *env, Node *n) {
         fprintf(stderr, "type error: too few arguments to '%s' (expected %d, got %d)\n",
                 n->as.call.name, fsig->param_count, i);
       }
+      n->as.call.ret_struct_name = fsig->ret_struct_name ? strdup_str(fsig->ret_struct_name) : NULL;
       return fsig->ret_type;
+    }
+    case NODE_STRUCT_DEF:
+      return TYPE_VOID;
+    case NODE_STRUCT_LITERAL: {
+      return TYPE_STRUCT;
+    }
+    case NODE_FIELD_ACCESS: {
+      TypeKind rt = type_check_expr(env, n->as.field_access.record);
+      if (rt != TYPE_STRUCT) {
+        type_errors++;
+        fprintf(stderr, "type error: field access '.' requires struct, got %s\n", type_name(rt));
+        return TYPE_VOID;
+      }
+      const char *sn = NULL;
+      Node *rec = n->as.field_access.record;
+      if (rec->type == NODE_VARIABLE)
+        sn = ty_env_get_struct_name(env, rec->as.variable.name);
+      else if (rec->type == NODE_STRUCT_LITERAL)
+        sn = rec->as.struct_lit.struct_name;
+      else if (rec->type == NODE_CALL)
+        sn = rec->as.call.ret_struct_name;
+      StructInfo *si = sn ? find_struct(sn) : NULL;
+      if (!si) {
+        type_errors++;
+        fprintf(stderr, "type error: cannot determine struct type for field access\n");
+        return TYPE_VOID;
+      }
+      for (int i = 0; i < si->field_count; i++) {
+        if (strcmp(si->field_names[i], n->as.field_access.field_name) == 0)
+          return si->field_types[i];
+      }
+      type_errors++;
+      fprintf(stderr, "type error: struct '%s' has no field '%s'\n", sn, n->as.field_access.field_name);
+      return TYPE_VOID;
     }
     case NODE_LET:
     case NODE_FN:
@@ -1367,7 +1693,16 @@ static TypeKind type_check_block(TyEnv *env, Node *n) {
         fprintf(stderr, "type error: let '%s' declared as %s but initializer is %s\n",
                 s->as.let.name, type_name(s->as.let.type), type_name(vt));
       }
-      ty_env_set(env, s->as.let.name, vt, s->as.let.elem_type);
+      const char *let_sn = s->as.let.struct_name;
+      if (vt == TYPE_STRUCT && !let_sn && s->as.let.value) {
+        if (s->as.let.value->type == NODE_STRUCT_LITERAL)
+          let_sn = s->as.let.value->as.struct_lit.struct_name;
+        else if (s->as.let.value->type == NODE_CALL)
+          let_sn = s->as.let.value->as.call.ret_struct_name;
+        else if (s->as.let.value->type == NODE_VARIABLE)
+          let_sn = ty_env_get_struct_name(env, s->as.let.value->as.variable.name);
+      }
+      ty_env_set(env, s->as.let.name, vt, s->as.let.elem_type, let_sn);
       last_type = vt;
     } else {
       last_type = type_check_expr(env, s);
@@ -1386,9 +1721,12 @@ static void type_check(Node *ast) {
     FnSig *sig = &fn_sigs[fn_sig_count++];
     sig->name = s->as.fn.name;
     sig->ret_type = s->as.fn.ret_type;
+    sig->ret_struct_name = s->as.fn.ret_struct_name ? strdup_str(s->as.fn.ret_struct_name) : NULL;
     sig->param_count = 0;
     for (Node *p = s->as.fn.params; p; p = p->next) {
-      sig->param_types[sig->param_count++] = p->as.variable.type;
+      sig->param_types[sig->param_count] = p->as.variable.type;
+      sig->param_struct_names[sig->param_count] = p->as.variable.struct_name ? strdup_str(p->as.variable.struct_name) : NULL;
+      sig->param_count++;
     }
   }
   // Second pass: check function bodies and main body
@@ -1397,7 +1735,7 @@ static void type_check(Node *ast) {
     TyEnv env;
     ty_env_init(&env);
     for (Node *p = s->as.fn.params; p; p = p->next) {
-      ty_env_set(&env, p->as.variable.name, p->as.variable.type, p->as.variable.elem_type);
+      ty_env_set(&env, p->as.variable.name, p->as.variable.type, p->as.variable.elem_type, p->as.variable.struct_name);
     }
     TypeKind body_type = type_check_block(&env, s->as.fn.body);
     if (s->as.fn.ret_type != TYPE_VOID && body_type != s->as.fn.ret_type) {
@@ -1418,7 +1756,16 @@ static void type_check(Node *ast) {
           fprintf(stderr, "type error: let '%s' declared as %s but initializer is %s\n",
                   s->as.let.name, type_name(s->as.let.type), type_name(vt));
         }
-        ty_env_set(&env, s->as.let.name, vt, s->as.let.elem_type);
+        const char *let_sn2 = s->as.let.struct_name;
+        if (vt == TYPE_STRUCT && !let_sn2 && s->as.let.value) {
+          if (s->as.let.value->type == NODE_STRUCT_LITERAL)
+            let_sn2 = s->as.let.value->as.struct_lit.struct_name;
+          else if (s->as.let.value->type == NODE_CALL)
+            let_sn2 = s->as.let.value->as.call.ret_struct_name;
+          else if (s->as.let.value->type == NODE_VARIABLE)
+            let_sn2 = ty_env_get_struct_name(&env, s->as.let.value->as.variable.name);
+        }
+        ty_env_set(&env, s->as.let.name, vt, s->as.let.elem_type, let_sn2);
       } else if (s->type != NODE_FN) {
         type_check_expr(&env, s);
       }
